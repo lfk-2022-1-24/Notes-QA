@@ -103,6 +103,78 @@ type QuestionFocus = {
   aspectWord?: string; // original (e.g. "优点"/"缺点")
 };
 
+function extractDefinitionTopic(question: string): string | null {
+  const q = question.trim();
+  if (!q) return null;
+  // Chinese: "索引是什么" / "索引是什么？" / "什么是索引"
+  const m1 = q.match(/^(.+?)\s*(?:是啥|是什么)\s*[?？]*$/);
+  if (m1) {
+    const topic = m1[1].trim();
+    return topic.length >= 2 ? topic : null;
+  }
+  const m2 = q.match(/(?:什么是)\s*(.+?)\??$/);
+  if (m2) {
+    const topic = m2[1].trim();
+    return topic.length >= 2 ? topic : null;
+  }
+  // English: "what is X"
+  const m3 = q.match(/\bwhat\s+is\s+(.+?)\??$/i);
+  if (m3) {
+    const topic = m3[1].trim();
+    return topic.length >= 2 ? topic : null;
+  }
+  return null;
+}
+
+function refineRangeByDefinitionTopic(
+  chunkContent: string,
+  chunkStartAbs: number,
+  topic: string
+): { content: string; startChar: number; endChar: number } | null {
+  const text = chunkContent.replace(/\r\n/g, "\n");
+  const t = topic.trim();
+  if (!t || t.length < 2) return null;
+
+  const candidates = [
+    `什么是${t}`,
+    `${t}是什么`,
+    `**什么是${t}**`,
+    `**${t}是什么**`,
+    `## ${t}`,
+    `### ${t}`,
+  ];
+
+  let idx = -1;
+  for (const c of candidates) {
+    const i = text.indexOf(c);
+    if (i >= 0 && (idx < 0 || i < idx)) idx = i;
+  }
+  if (idx < 0) return null;
+
+  // Start at line boundary.
+  const prevNl = text.lastIndexOf("\n", idx);
+  let startIdx = prevNl >= 0 ? prevNl + 1 : 0;
+
+  // End at next heading-like boundary, else next paragraph break, else a max window.
+  let endIdx = Math.min(text.length, startIdx + 1200);
+  const after = startIdx + 1;
+
+  const nextMdHeading = text.slice(after).search(/\n\s*#{1,6}\s+\S+/);
+  if (nextMdHeading >= 0) endIdx = Math.min(endIdx, after + nextMdHeading);
+
+  const para = text.slice(after, endIdx).search(/\n\s*\n/);
+  if (para >= 0 && para < 900) endIdx = Math.min(endIdx, after + para);
+
+  // Ensure we include body content beyond the title line.
+  if (endIdx - startIdx < 120) endIdx = Math.min(text.length, startIdx + 500);
+
+  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+  const snippet = text.slice(startIdx, endIdx);
+  if (!snippet.trim()) return null;
+
+  return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
+}
+
 function extractQuestionNumber(question: string): number | null {
   const q = question.trim();
   if (!q) return null;
@@ -239,6 +311,38 @@ function getAllQuestionHeaderPositions(text: string): number[] {
   return headers.sort((a, b) => a - b);
 }
 
+function looksLikeQuestionHeader(line: string): boolean {
+  const s = line.trim();
+  if (!s) return false;
+  // Question mark or common interrogatives.
+  return /[?？]/.test(s) || /(什么|为什么|如何|怎么|哪些|是否|几种|多少|区别)/.test(s);
+}
+
+function getAllLikelyQuestionHeaderPositions(text: string): number[] {
+  const headers: number[] = [];
+  const patterns: RegExp[] = [
+    /(^|\n)\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/gm,
+    /(^|\n)\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)\s*[:：.．、)）]?/gm,
+    /(^|\n)\s*\(\s*\d{1,4}\s*\)\s*/gm,
+  ];
+
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      if (m.index === undefined) continue;
+      const prefix = m[1] ?? "";
+      const idx = m.index + prefix.length;
+      const lineEnd = text.indexOf("\n", idx);
+      const line = (lineEnd >= 0 ? text.slice(idx, lineEnd) : text.slice(idx)).slice(0, 120);
+      // Only treat as a "question header" if it looks like a question line.
+      // This avoids mistaking markdown ordered lists ("4. 主从复制...") as question blocks.
+      if (!looksLikeQuestionHeader(line)) continue;
+      headers.push(idx);
+    }
+  }
+
+  return headers.sort((a, b) => a - b);
+}
+
 function refineRangeByQuestionMatch(
   chunkContent: string,
   chunkStartAbs: number,
@@ -257,7 +361,15 @@ function refineRangeByQuestionMatch(
   if (matchIdx === null) return null;
 
   // Try to bound by nearest question header before the match, and next header after it.
-  const headers = getAllQuestionHeaderPositions(text);
+  const headers = getAllLikelyQuestionHeaderPositions(text);
+  if (headers.length < 2) {
+    // Not a numbered Q/A style chunk; fall back to a small window around match.
+    const start = Math.max(0, matchIdx - 140);
+    const end = Math.min(text.length, matchIdx + 520);
+    const snippet = text.slice(start, end).trim();
+    if (!snippet) return null;
+    return { content: snippet, startChar: chunkStartAbs + start, endChar: chunkStartAbs + end };
+  }
   let startIdx = 0;
   for (const h of headers) {
     if (h <= matchIdx) startIdx = h;
@@ -378,6 +490,7 @@ export async function POST(req: NextRequest) {
     // Rewrite for retrieval so pronouns like "it/its/他的/它的" become standalone.
     const retrievalQuestion = await rewriteStandaloneQuestion(question, safeHistory);
     const focus = extractFocus(retrievalQuestion);
+    const defTopic = extractDefinitionTopic(retrievalQuestion);
     const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
 
     // Embed the question
@@ -515,6 +628,9 @@ export async function POST(req: NextRequest) {
       let s = 0;
       if (focus.topic && c.includes(focus.topic)) s += 6;
       if (focus.aspectWord && c.includes(focus.aspectWord)) s += 3;
+      if (defTopic && c.includes(defTopic)) s += 4;
+      if (defTopic && c.includes(`${defTopic}是`)) s += 6;
+      if (defTopic && (c.includes("目的") || c.includes("作用") || c.includes("用于"))) s += 2;
       if (qNoPunct && c.includes(qNoPunct)) s += 2;
       if (rawQ && c.includes(rawQ)) s += 2;
       if (qNoPunct && c.includes(`Q4: ${qNoPunct}`)) s += 6;
@@ -526,47 +642,12 @@ export async function POST(req: NextRequest) {
       .sort((a, b) => scoreExact(b.content) - scoreExact(a.content) || b.similarity - a.similarity)
       .slice(0, TOP_K);
 
-    // Build source objects
-    const sources: SourceChunk[] = relevantChunks.map((row, index) => {
+    // Build base sources (full chunk content) for the LLM.
+    const baseSources: SourceChunk[] = relevantChunks.map((row, index) => {
       const chunkStart =
         typeof row.start_char === "number" ? row.start_char : Number.parseInt(row.start_char, 10);
       const chunkEnd = typeof row.end_char === "number" ? row.end_char : Number.parseInt(row.end_char, 10);
 
-      // Try to narrow highlight range for numbered Q/A PDFs:
-      // If user asks "第14题/第14个问题…", highlight only that section, not the whole chunk.
-      if (qNum && Number.isFinite(chunkStart)) {
-        const refined = refineRangeByNumber(row.content, chunkStart, qNum);
-        if (refined) {
-          return {
-            index: index + 1,
-            noteId: row.note_id,
-            filename: row.filename,
-            content: refined.content,
-            startChar: refined.startChar,
-            endChar: refined.endChar,
-            similarity: row.similarity,
-          };
-        }
-      }
-
-      // If question doesn't include a number, try to locate the question's key terms
-      // within the chunk and then bound it by the nearest numbered header (e.g. 14. / 14、).
-      if (Number.isFinite(chunkStart)) {
-        const refined = refineRangeByQuestionMatch(row.content, chunkStart, retrievalQuestion);
-        if (refined) {
-          return {
-            index: index + 1,
-            noteId: row.note_id,
-            filename: row.filename,
-            content: refined.content,
-            startChar: refined.startChar,
-            endChar: refined.endChar,
-            similarity: row.similarity,
-          };
-        }
-      }
-
-      // Default: keep chunk-level range.
       return {
         index: index + 1,
         noteId: row.note_id,
@@ -579,8 +660,34 @@ export async function POST(req: NextRequest) {
     });
 
     const focusedSources = focus.topic
-      ? sources.filter((s) => s.content.includes(focus.topic!)).slice(0, LLM_TOP_K)
-      : sources.slice(0, LLM_TOP_K);
+      ? baseSources.filter((s) => s.content.includes(focus.topic!)).slice(0, LLM_TOP_K)
+      : baseSources.slice(0, LLM_TOP_K);
+
+    // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
+    const uiSources: SourceChunk[] = focusedSources.map((s) => {
+      if (!Number.isFinite(s.startChar)) return s;
+
+      if (defTopic) {
+        const refined = refineRangeByDefinitionTopic(s.content, s.startChar, defTopic);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
+      if (qNum) {
+        const refined = refineRangeByNumber(s.content, s.startChar, qNum);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
+      const refined = refineRangeByQuestionMatch(s.content, s.startChar, retrievalQuestion);
+      if (refined) {
+        return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+      }
+
+      return s;
+    });
 
     // Ask LLM with sources
     const result = await askQuestion(question, focusedSources, {
@@ -590,7 +697,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       answer: result.answer,
-      sources: result.sources,
+      sources: uiSources,
       hasAnswer: result.hasAnswer,
       rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
     });
