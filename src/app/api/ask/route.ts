@@ -281,6 +281,12 @@ function extractMatchTokensFromQuestion(question: string): string[] {
     "要",
     "的",
     "吗",
+    // Very generic tokens that often appear everywhere; they skew "earliest match" to the document start.
+    "agent",
+    "Agent",
+    "llm",
+    "LLM",
+    "模型",
   ]);
 
   const tokens = new Set<string>();
@@ -291,6 +297,83 @@ function extractMatchTokensFromQuestion(question: string): string[] {
   }
   // Prefer longer tokens first (e.g. "国歌" > "什么")
   return Array.from(tokens).sort((a, b) => b.length - a.length).slice(0, 12);
+}
+
+function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
+  if (tokens.length === 0) return null;
+
+  // Collect limited occurrences for each token.
+  const positionsByToken = new Map<string, number[]>();
+  for (const t of tokens) {
+    const pos: number[] = [];
+    let from = 0;
+    let guard = 0;
+    while (from < text.length && guard < 25) {
+      const idx = text.indexOf(t, from);
+      if (idx < 0) break;
+      pos.push(idx);
+      from = idx + Math.max(1, Math.floor(t.length / 2));
+      guard++;
+    }
+    if (pos.length > 0) positionsByToken.set(t, pos);
+  }
+
+  const candidates: number[] = [];
+  for (const pos of positionsByToken.values()) candidates.push(...pos);
+  if (candidates.length === 0) return null;
+
+  const uniqCandidates = Array.from(new Set(candidates)).sort((a, b) => a - b).slice(0, 200);
+
+  // Score each candidate by how many (and how "specific") tokens appear in a window around it.
+  const windowBefore = 260;
+  const windowAfter = 900;
+  let bestIdx: number | null = null;
+  let bestScore = -Infinity;
+  let bestHitCount = -Infinity;
+
+  const tokenFreq = (t: string) => positionsByToken.get(t)?.length ?? 0;
+
+  for (const idx of uniqCandidates) {
+    const start = Math.max(0, idx - windowBefore);
+    const end = Math.min(text.length, idx + windowAfter);
+
+    let score = 0;
+    let hitCount = 0;
+    for (const t of tokens) {
+      const occurrences = positionsByToken.get(t);
+      if (!occurrences) continue;
+      // Is there any occurrence within [start, end)?
+      let present = false;
+      for (const p of occurrences) {
+        if (p < start) continue;
+        if (p >= end) break;
+        present = true;
+        break;
+      }
+      if (!present) continue;
+      hitCount++;
+      // Longer tokens are more specific; downweight very frequent tokens.
+      const freq = tokenFreq(t);
+      const freqPenalty = freq >= 8 ? 0.35 : freq >= 4 ? 0.2 : 0;
+      score += Math.max(1, Math.min(8, t.length)) * (1 - freqPenalty);
+    }
+
+    // Prefer matches that are not at the very start when score ties.
+    const startBiasPenalty = idx < 120 ? 0.8 : 0;
+    score -= startBiasPenalty;
+
+    if (
+      score > bestScore ||
+      (score === bestScore && hitCount > bestHitCount) ||
+      (score === bestScore && hitCount === bestHitCount && bestIdx !== null && idx > bestIdx)
+    ) {
+      bestScore = score;
+      bestHitCount = hitCount;
+      bestIdx = idx;
+    }
+  }
+
+  return bestIdx;
 }
 
 function getAllQuestionHeaderPositions(text: string): number[] {
@@ -352,12 +435,7 @@ function refineRangeByQuestionMatch(
   const tokens = extractMatchTokensFromQuestion(question);
   if (tokens.length === 0) return null;
 
-  // Find earliest occurrence of any token.
-  let matchIdx: number | null = null;
-  for (const t of tokens) {
-    const idx = text.indexOf(t);
-    if (idx >= 0 && (matchIdx === null || idx < matchIdx)) matchIdx = idx;
-  }
+  const matchIdx = findBestKeywordMatchIndex(text, tokens);
   if (matchIdx === null) return null;
 
   // Try to bound by nearest question header before the match, and next header after it.

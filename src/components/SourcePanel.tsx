@@ -19,6 +19,7 @@ interface HighlightRange {
   noteId: string;
   startChar: number;
   endChar: number;
+  anchorText?: string;
 }
 
 interface SourcePanelProps {
@@ -113,7 +114,30 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   const renderHighlightedContent = (content: string) => {
     if (!highlight) return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
 
-    const { startChar, endChar } = highlight;
+    let { startChar, endChar } = highlight;
+
+    // Prefer anchorText alignment even when offsets look valid.
+    // This makes TXT/large notes robust when stored offsets drift.
+    if (highlight.anchorText) {
+      const anchor = highlight.anchorText.trim().slice(0, 260);
+      if (anchor.length >= 20) {
+        const idx = content.indexOf(anchor);
+        if (idx >= 0) {
+          startChar = idx;
+          endChar = Math.min(content.length, idx + anchor.length);
+        }
+      }
+    }
+
+    const isRangeValid =
+      Number.isFinite(startChar) &&
+      Number.isFinite(endChar) &&
+      startChar >= 0 &&
+      endChar > startChar &&
+      endChar <= content.length;
+
+    if (!Number.isFinite(startChar) || startChar < 0) startChar = 0;
+    if (!Number.isFinite(endChar) || endChar <= startChar) endChar = Math.min(content.length, startChar + 200);
     if (startChar >= content.length) return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
 
     const before = content.slice(0, startChar);

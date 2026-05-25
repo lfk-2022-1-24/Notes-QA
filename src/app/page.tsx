@@ -9,6 +9,7 @@ interface HighlightRange {
   noteId: string;
   startChar: number;
   endChar: number;
+  anchorText?: string;
 }
 
 export default function Home() {

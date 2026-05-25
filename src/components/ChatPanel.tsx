@@ -16,6 +16,7 @@ interface HighlightRange {
   noteId: string;
   startChar: number;
   endChar: number;
+  anchorText?: string;
 }
 
 interface ChatPanelProps {
@@ -206,6 +207,7 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                   noteId: source.noteId,
                   startChar: source.startChar,
                   endChar: source.endChar,
+                  anchorText: source.content.slice(0, 600),
                 })
               }
               className="inline-flex items-center px-1 py-0.5 text-xs font-medium bg-blue-100 text-blue-700 rounded hover:bg-blue-200 cursor-pointer"
@@ -312,6 +314,7 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                         noteId: source.noteId,
                         startChar: source.startChar,
                         endChar: source.endChar,
+                        anchorText: source.content.slice(0, 600),
                       })
                     }
                   >
