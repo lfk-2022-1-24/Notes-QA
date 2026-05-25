@@ -333,8 +333,8 @@ export async function POST(req: NextRequest) {
       noteId: row.note_id,
       filename: row.filename,
       content: row.content,
-      startChar: parseInt(row.start_char),
-      endChar: parseInt(row.end_char),
+      startChar: typeof row.start_char === "number" ? row.start_char : parseInt(row.start_char, 10),
+      endChar: typeof row.end_char === "number" ? row.end_char : parseInt(row.end_char, 10),
       similarity: row.similarity,
     }));
 

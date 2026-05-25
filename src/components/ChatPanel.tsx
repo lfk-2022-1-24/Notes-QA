@@ -45,6 +45,16 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  const extractCitedSourceIndices = (answerText: string): Set<number> => {
+    const set = new Set<number>();
+    if (!answerText) return set;
+    for (const m of answerText.matchAll(/\[(\d+)\]/g)) {
+      const n = Number.parseInt(m[1], 10);
+      if (Number.isFinite(n)) set.add(n);
+    }
+    return set;
+  };
+
   const historyForFollowups = useMemo<HistoryTurn[]>(() => {
     return messages
       .filter((m) => typeof m.answer === "string" && m.answer.trim().length > 0)
@@ -282,10 +292,18 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
             )}
 
             {/* Sources */}
-            {m.sources.length > 0 && (
+            {(() => {
+              if (m.sources.length === 0) return null;
+              const cited = extractCitedSourceIndices(typeof m.answer === "string" ? m.answer : "");
+              const displaySources = m.sources
+                .filter((s) => cited.has(s.index))
+                .sort((a, b) => a.index - b.index);
+              if (displaySources.length === 0) return null;
+
+              return (
               <div className="space-y-2">
                 <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Sources</h3>
-                {m.sources.map((source) => (
+                {displaySources.map((source) => (
                   <div
                     key={`${m.id}-${source.index}`}
                     className="p-2 bg-gray-50 rounded border border-gray-100 cursor-pointer hover:bg-gray-100 transition-colors"
@@ -309,7 +327,8 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                   </div>
                 ))}
               </div>
-            )}
+              );
+            })()}
           </div>
         ))}
 
