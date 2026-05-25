@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 interface Note {
   id: string;
@@ -30,6 +30,9 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   const [notes, setNotes] = useState<Note[]>([]);
   const [expandedNote, setExpandedNote] = useState<string | null>(null);
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const expandedHeaderRef = useRef<HTMLDivElement | null>(null);
+  const highlightRef = useRef<HTMLElement | null>(null);
 
   const loadNoteDetail = useCallback(async (noteId: string) => {
     try {
@@ -63,6 +66,24 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
       loadNoteDetail(highlight.noteId);
     }
   }, [highlight, loadNoteDetail]);
+
+  // Auto scroll to the expanded note + highlighted range.
+  useEffect(() => {
+    if (!highlight?.noteId) return;
+    if (expandedNote !== highlight.noteId) return;
+    if (!noteDetail || noteDetail.note.id !== highlight.noteId) return;
+
+    // 1) Ensure the expanded note header is visible in the list.
+    expandedHeaderRef.current?.scrollIntoView({ block: "nearest" });
+
+    // 2) Scroll to highlighted text inside the note content.
+    // Wait a tick so <mark> exists in the DOM.
+    const t = window.setTimeout(() => {
+      highlightRef.current?.scrollIntoView({ block: "center" });
+    }, 0);
+
+    return () => window.clearTimeout(t);
+  }, [highlight, expandedNote, noteDetail]);
 
   const toggleNote = (noteId: string) => {
     if (expandedNote === noteId) {
@@ -102,7 +123,14 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
     return (
       <pre className="whitespace-pre-wrap text-sm">
         {before}
-        <mark className="bg-yellow-200 px-0.5 rounded">{highlighted}</mark>
+        <mark
+          ref={(el) => {
+            highlightRef.current = el;
+          }}
+          className="bg-yellow-200 px-0.5 rounded"
+        >
+          {highlighted}
+        </mark>
         {after}
       </pre>
     );
@@ -113,7 +141,7 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
       <div className="p-3 border-b border-gray-200">
         <h2 className="font-semibold text-gray-700">Notes ({notes.length})</h2>
       </div>
-      <div className="flex-1 overflow-y-auto">
+      <div ref={listRef} className="flex-1 overflow-y-auto">
         {notes.length === 0 ? (
           <div className="p-4 text-gray-400 text-center text-sm">
             No notes uploaded yet
@@ -123,6 +151,7 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
             {notes.map((note) => (
               <div key={note.id}>
                 <div
+                  ref={note.id === expandedNote ? expandedHeaderRef : undefined}
                   className="flex items-center justify-between p-3 hover:bg-gray-50 cursor-pointer"
                   onClick={() => toggleNote(note.id)}
                 >

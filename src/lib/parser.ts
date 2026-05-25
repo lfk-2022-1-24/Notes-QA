@@ -1,8 +1,30 @@
 import matter from "gray-matter";
 import iconv from "iconv-lite";
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const pdfParse = require("pdf-parse");
+type PDFParseInstance = {
+  getText: () => Promise<{ text: string }>;
+  destroy: () => Promise<void>;
+};
+
+type PDFParseCtor = new (options: { data: Buffer | Uint8Array }) => PDFParseInstance;
+
+let cachedPDFParseClass: PDFParseCtor | null = null;
+
+async function getPDFParseClass() {
+  if (cachedPDFParseClass) return cachedPDFParseClass;
+
+  // pdf-parse@2.x exports a PDFParse class (not a function).
+  // Use dynamic import to work in Next.js bundler/module environments.
+  const mod: unknown = await import("pdf-parse");
+  const cls =
+    (mod as { PDFParse?: unknown }).PDFParse ??
+    (mod as { default?: { PDFParse?: unknown } }).default?.PDFParse;
+  if (typeof cls !== "function") {
+    throw new Error("pdf-parse PDFParse export is not a constructor");
+  }
+  cachedPDFParseClass = cls as unknown as PDFParseCtor;
+  return cachedPDFParseClass;
+}
 
 export interface ParseResult {
   text: string;
@@ -40,8 +62,14 @@ function parsePlainText(buffer: Buffer): ParseResult {
 }
 
 async function parsePdf(buffer: Buffer): Promise<ParseResult> {
-  const data = await pdfParse(buffer);
-  return { text: data.text, fileType: "pdf" };
+  const PDFParse = await getPDFParseClass();
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const data = await parser.getText();
+    return { text: data.text, fileType: "pdf" };
+  } finally {
+    await parser.destroy();
+  }
 }
 
 function decodeTextBuffer(buffer: Buffer): string {

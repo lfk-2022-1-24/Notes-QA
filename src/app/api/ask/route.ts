@@ -103,6 +103,202 @@ type QuestionFocus = {
   aspectWord?: string; // original (e.g. "优点"/"缺点")
 };
 
+function extractQuestionNumber(question: string): number | null {
+  const q = question.trim();
+  if (!q) return null;
+  // Common Chinese phrasing: "第14题" / "第14个问题" / "第14问"
+  const m1 = q.match(/第\s*(\d{1,4})\s*(?:题|个问题|问题|问)\b/);
+  if (m1) return Number.parseInt(m1[1], 10);
+  // Sometimes: "14题是什么" / "14. 什么是..."
+  const m2 = q.match(/(?:^|[^\d])(\d{1,4})\s*(?:题|问)\b/);
+  if (m2) return Number.parseInt(m2[1], 10);
+  return null;
+}
+
+function refineRangeByNumber(
+  chunkContent: string,
+  chunkStartAbs: number,
+  n: number
+): { content: string; startChar: number; endChar: number } | null {
+  const text = chunkContent.replace(/\r\n/g, "\n");
+
+  const startPatterns: RegExp[] = [
+    new RegExp(`(^|\\n)\\s*(?:Q\\s*)?${n}\\s*[:：.．、)）]`, "m"),
+    new RegExp(`(^|\\n)\\s*第\\s*${n}\\s*(?:题|问|个问题|问题)\\s*[:：.．、)）]?`, "m"),
+    // Loose: "14 " (followed by punctuation) in Q/A PDFs
+    new RegExp(`(^|\\n)\\s*${n}\\s*[.．、)]`, "m"),
+  ];
+
+  let startIdx: number | null = null;
+  for (const re of startPatterns) {
+    const m = text.match(re);
+    if (!m || m.index === undefined) continue;
+    const prefix = m[1] ?? "";
+    const idx = m.index + prefix.length;
+    if (startIdx === null || idx < startIdx) startIdx = idx;
+  }
+  if (startIdx === null) return null;
+
+  const afterStart = startIdx + 1;
+  const nextCandidates: number[] = [];
+
+  // Next Arabic-number question header
+  const anyArabic = /(^|\n)\s*(?:Q\s*)?(\d{1,4})\s*[:：.．、)）]/gm;
+  for (const m of text.slice(afterStart).matchAll(anyArabic)) {
+    const num = Number.parseInt(m[2], 10);
+    if (num === n) continue;
+    const prefix = m[1] ?? "";
+    const idx = afterStart + (m.index ?? 0) + prefix.length;
+    nextCandidates.push(idx);
+    break; // first is closest
+  }
+
+  // Next Chinese "第xx题/问"
+  const anyChinese = /(^|\n)\s*第\s*(\d{1,4})\s*(?:题|问|个问题|问题)\b/gm;
+  for (const m of text.slice(afterStart).matchAll(anyChinese)) {
+    const num = Number.parseInt(m[2], 10);
+    if (num === n) continue;
+    const prefix = m[1] ?? "";
+    const idx = afterStart + (m.index ?? 0) + prefix.length;
+    nextCandidates.push(idx);
+    break;
+  }
+
+  // Paragraph boundary as fallback end marker
+  const paraBreak = text.slice(afterStart).search(/\n\s*\n/);
+  if (paraBreak >= 0) nextCandidates.push(afterStart + paraBreak);
+
+  let endIdx =
+    nextCandidates.length > 0 ? Math.min(...nextCandidates) : Math.min(text.length, startIdx + 700);
+
+  if (endIdx <= startIdx) endIdx = Math.min(text.length, startIdx + 700);
+
+  // Trim whitespace, but keep the leading question marker itself.
+  let localStart = startIdx;
+  let localEnd = endIdx;
+  while (localEnd > localStart && /\s/.test(text[localEnd - 1]!)) localEnd--;
+  while (localStart < localEnd && text[localStart] === "\n") localStart++;
+
+  const snippet = text.slice(localStart, localEnd);
+  if (!snippet.trim()) return null;
+
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + localStart,
+    endChar: chunkStartAbs + localEnd,
+  };
+}
+
+function extractMatchTokensFromQuestion(question: string): string[] {
+  const q = question
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, " ");
+
+  const stop = new Set([
+    "什么",
+    "为什么",
+    "怎么",
+    "如何",
+    "是不是",
+    "是否",
+    "听到",
+    "需要",
+    "应该",
+    "要不要",
+    "要",
+    "的",
+    "吗",
+  ]);
+
+  const tokens = new Set<string>();
+  for (const m of q.matchAll(/[\p{Script=Han}A-Za-z0-9]{2,}/gu)) {
+    const t = m[0].trim();
+    if (!t || stop.has(t)) continue;
+    tokens.add(t);
+  }
+  // Prefer longer tokens first (e.g. "国歌" > "什么")
+  return Array.from(tokens).sort((a, b) => b.length - a.length).slice(0, 12);
+}
+
+function getAllQuestionHeaderPositions(text: string): number[] {
+  const headers: number[] = [];
+  const patterns: RegExp[] = [
+    /(^|\n)\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/gm, // 14. / 14、 / Q14:
+    /(^|\n)\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)\s*[:：.．、)）]?/gm, // 第14题
+    /(^|\n)\s*\(\s*\d{1,4}\s*\)\s*/gm, // (14)
+  ];
+
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      if (m.index === undefined) continue;
+      const prefix = m[1] ?? "";
+      headers.push(m.index + prefix.length);
+    }
+  }
+  return headers.sort((a, b) => a - b);
+}
+
+function refineRangeByQuestionMatch(
+  chunkContent: string,
+  chunkStartAbs: number,
+  question: string
+): { content: string; startChar: number; endChar: number } | null {
+  const text = chunkContent.replace(/\r\n/g, "\n");
+  const tokens = extractMatchTokensFromQuestion(question);
+  if (tokens.length === 0) return null;
+
+  // Find earliest occurrence of any token.
+  let matchIdx: number | null = null;
+  for (const t of tokens) {
+    const idx = text.indexOf(t);
+    if (idx >= 0 && (matchIdx === null || idx < matchIdx)) matchIdx = idx;
+  }
+  if (matchIdx === null) return null;
+
+  // Try to bound by nearest question header before the match, and next header after it.
+  const headers = getAllQuestionHeaderPositions(text);
+  let startIdx = 0;
+  for (const h of headers) {
+    if (h <= matchIdx) startIdx = h;
+    else break;
+  }
+
+  // Avoid jumping too far up if headers are sparse; in that case just start near the match.
+  if (matchIdx - startIdx > 1200) startIdx = Math.max(0, matchIdx - 200);
+
+  let endIdx = Math.min(text.length, startIdx + 900);
+  for (const h of headers) {
+    if (h > startIdx + 1) {
+      endIdx = h;
+      break;
+    }
+  }
+
+  // If header-based end is still huge, clamp.
+  if (endIdx - startIdx > 1400) endIdx = Math.min(text.length, startIdx + 1400);
+
+  // Prefer to end at a paragraph break if it occurs reasonably soon.
+  const para = text.slice(startIdx + 1, endIdx).search(/\n\s*\n/);
+  if (para >= 0 && para < 900) endIdx = startIdx + 1 + para;
+
+  // Trim end whitespace.
+  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+  // Keep at least a small window.
+  if (endIdx - startIdx < 40) {
+    endIdx = Math.min(text.length, startIdx + 200);
+  }
+
+  const snippet = text.slice(startIdx, endIdx);
+  if (!snippet.trim()) return null;
+
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + startIdx,
+    endChar: chunkStartAbs + endIdx,
+  };
+}
+
 function extractFocus(question: string): QuestionFocus {
   const q = question.trim();
 
@@ -151,8 +347,10 @@ function clipToFocusedSection(content: string, focus: QuestionFocus): string {
     if (near >= 0) idx = near;
   }
 
-  const start = Math.max(0, idx - 250);
-  const end = Math.min(text.length, idx + 900);
+  // Keep this window relatively small so citation highlighting is precise.
+  // (The raw chunk is still stored in DB; this is only what we return to UI/LLM.)
+  const start = Math.max(0, idx - 120);
+  const end = Math.min(text.length, idx + 420);
   return text.slice(start, end);
 }
 
@@ -180,6 +378,7 @@ export async function POST(req: NextRequest) {
     // Rewrite for retrieval so pronouns like "it/its/他的/它的" become standalone.
     const retrievalQuestion = await rewriteStandaloneQuestion(question, safeHistory);
     const focus = extractFocus(retrievalQuestion);
+    const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
 
     // Embed the question
     const normalizedQuestion = normalizeForEmbedding(retrievalQuestion);
@@ -328,26 +527,60 @@ export async function POST(req: NextRequest) {
       .slice(0, TOP_K);
 
     // Build source objects
-    const sources: SourceChunk[] = relevantChunks.map((row, index) => ({
-      index: index + 1,
-      noteId: row.note_id,
-      filename: row.filename,
-      content: row.content,
-      startChar: typeof row.start_char === "number" ? row.start_char : parseInt(row.start_char, 10),
-      endChar: typeof row.end_char === "number" ? row.end_char : parseInt(row.end_char, 10),
-      similarity: row.similarity,
-    }));
+    const sources: SourceChunk[] = relevantChunks.map((row, index) => {
+      const chunkStart =
+        typeof row.start_char === "number" ? row.start_char : Number.parseInt(row.start_char, 10);
+      const chunkEnd = typeof row.end_char === "number" ? row.end_char : Number.parseInt(row.end_char, 10);
 
-    const focusedSources =
-      focus.topic
-        ? sources
-            .filter((s) => s.content.includes(focus.topic!))
-            .map((s) => ({
-              ...s,
-              content: clipToFocusedSection(s.content, focus),
-            }))
-            .slice(0, LLM_TOP_K)
-        : sources.slice(0, LLM_TOP_K);
+      // Try to narrow highlight range for numbered Q/A PDFs:
+      // If user asks "第14题/第14个问题…", highlight only that section, not the whole chunk.
+      if (qNum && Number.isFinite(chunkStart)) {
+        const refined = refineRangeByNumber(row.content, chunkStart, qNum);
+        if (refined) {
+          return {
+            index: index + 1,
+            noteId: row.note_id,
+            filename: row.filename,
+            content: refined.content,
+            startChar: refined.startChar,
+            endChar: refined.endChar,
+            similarity: row.similarity,
+          };
+        }
+      }
+
+      // If question doesn't include a number, try to locate the question's key terms
+      // within the chunk and then bound it by the nearest numbered header (e.g. 14. / 14、).
+      if (Number.isFinite(chunkStart)) {
+        const refined = refineRangeByQuestionMatch(row.content, chunkStart, retrievalQuestion);
+        if (refined) {
+          return {
+            index: index + 1,
+            noteId: row.note_id,
+            filename: row.filename,
+            content: refined.content,
+            startChar: refined.startChar,
+            endChar: refined.endChar,
+            similarity: row.similarity,
+          };
+        }
+      }
+
+      // Default: keep chunk-level range.
+      return {
+        index: index + 1,
+        noteId: row.note_id,
+        filename: row.filename,
+        content: row.content,
+        startChar: chunkStart,
+        endChar: chunkEnd,
+        similarity: row.similarity,
+      };
+    });
+
+    const focusedSources = focus.topic
+      ? sources.filter((s) => s.content.includes(focus.topic!)).slice(0, LLM_TOP_K)
+      : sources.slice(0, LLM_TOP_K);
 
     // Ask LLM with sources
     const result = await askQuestion(question, focusedSources, {
