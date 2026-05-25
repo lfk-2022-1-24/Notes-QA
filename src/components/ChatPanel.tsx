@@ -22,6 +22,11 @@ interface ChatPanelProps {
   onCitationClick: (highlight: HighlightRange) => void;
 }
 
+interface HistoryTurn {
+  question: string;
+  answer: string;
+}
+
 export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const [question, setQuestion] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -29,10 +34,12 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const [sources, setSources] = useState<Source[]>([]);
   const [hasAnswer, setHasAnswer] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<HistoryTurn[]>([]);
 
   const handleAsk = async () => {
     if (!question.trim() || isLoading) return;
 
+    const currentQuestion = question.trim();
     setIsLoading(true);
     setError(null);
     setAnswer(null);
@@ -43,7 +50,7 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: question.trim() }),
+        body: JSON.stringify({ question: currentQuestion, history: history.slice(-6) }),
       });
 
       if (!res.ok) {
@@ -55,6 +62,11 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
       setAnswer(data.answer);
       setSources(data.sources || []);
       setHasAnswer(data.hasAnswer);
+
+      // Append to history for follow-up questions.
+      if (typeof data.answer === "string" && data.answer.trim()) {
+        setHistory((h) => [...h.slice(-5), { question: currentQuestion, answer: data.answer }]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to get answer");
     } finally {

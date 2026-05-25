@@ -23,6 +23,16 @@ export interface AskResult {
   hasAnswer: boolean;
 }
 
+export interface HistoryTurn {
+  question: string;
+  answer: string;
+}
+
+export interface AskOptions {
+  focusTopic?: string;
+  focusAspect?: string;
+}
+
 const SYSTEM_PROMPT = `You are a helpful assistant that answers questions based ONLY on the provided source notes.
 
 Rules:
@@ -34,9 +44,81 @@ Rules:
 6. Do NOT use external knowledge to supplement the answer.
 7. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
 
+const REWRITE_SYSTEM_PROMPT = `You rewrite a user's question into a standalone question using chat history.
+
+Rules:
+1. Output ONLY the rewritten standalone question, nothing else.
+2. Resolve references like "it", "they", "this", "that", "he/she", "其/它/他/她/他们/这个/那个/上述/该/此" to the most likely subject from the history.
+3. Keep the user's language (Chinese stays Chinese, English stays English).
+4. If the question is already standalone, output it unchanged.
+5. Do NOT add extra questions or commentary.`;
+
+function maybeResolveWithHeuristic(question: string, history: HistoryTurn[]): string {
+  const q = question.trim();
+  const last = history.at(-1)?.question?.trim();
+  if (!last) return q;
+
+  const hasPronoun =
+    /(^|\s)(it|they|them|this|that|these|those)\b/i.test(q) ||
+    /(它|他|她|他们|其|这个|那个|上述|前面|上一个|该|此|其优点|其缺点|它的|他的|她的)/.test(q);
+
+  if (!hasPronoun) return q;
+
+  // Extract a rough "topic" from the last question by removing common suffixes.
+  const topic = last
+    .replace(/[？?]\s*$/g, "")
+    .replace(/(有哪些|有什么|是什么|分别是什么|主要是|如何|怎么)(.+)?$/g, "")
+    .replace(/(的)?(优点|缺点|好处|坏处|作用|意义|风险|问题)\s*$/g, "")
+    .trim();
+
+  if (!topic) return q;
+  // Example: "它的缺点是什么？" -> "垂直拆分的缺点是什么？"
+  return q
+    .replace(/^(它|他|她|其|这个|那个|上述|该|此)/, topic)
+    .replace(/(它|他|她|其)(的)/g, `${topic}$2`);
+}
+
+export async function rewriteStandaloneQuestion(
+  question: string,
+  history: HistoryTurn[]
+): Promise<string> {
+  const trimmed = question.trim();
+  if (!trimmed) return trimmed;
+  if (!history || history.length === 0) return trimmed;
+
+  // Keep the history short to control cost.
+  const recent = history.slice(-3);
+  const historyText = recent
+    .map((t, i) => `Turn ${i + 1}:\nUser: ${t.question}\nAssistant: ${t.answer}`)
+    .join("\n\n");
+
+  try {
+    const response = await deepseekClient.chat.completions.create({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: REWRITE_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `Chat history:\n${historyText}\n\nUser question:\n${trimmed}\n\nRewrite into a standalone question:`,
+        },
+      ],
+      temperature: 0.0,
+      max_tokens: 128,
+    });
+
+    const out = (response.choices[0]?.message?.content || "").trim();
+    // Basic sanity checks: keep it short and single-line-ish.
+    if (!out || out.length > 300) return maybeResolveWithHeuristic(trimmed, recent);
+    return out.replace(/\s+/g, " ").trim();
+  } catch {
+    return maybeResolveWithHeuristic(trimmed, recent);
+  }
+}
+
 export async function askQuestion(
   question: string,
-  sources: SourceChunk[]
+  sources: SourceChunk[],
+  options?: AskOptions
 ): Promise<AskResult> {
   if (sources.length === 0) {
     return {
@@ -50,7 +132,14 @@ export async function askQuestion(
     .map((s) => `[Source ${s.index}] (from "${s.filename}"):\n${s.content}`)
     .join("\n\n---\n\n");
 
-  const userMessage = `Here are the source notes:\n\n${sourceText}\n\n---\n\nQuestion: ${question}`;
+  const focusLine =
+    options?.focusTopic
+      ? `Focus: Answer ONLY about "${options.focusTopic}"${
+          options.focusAspect ? ` (${options.focusAspect})` : ""
+        }. Do not discuss other topics unless the question explicitly asks.\n\n`
+      : "";
+
+  const userMessage = `${focusLine}Here are the source notes:\n\n${sourceText}\n\n---\n\nQuestion: ${question}`;
 
   const response = await deepseekClient.chat.completions.create({
     model: CHAT_MODEL,

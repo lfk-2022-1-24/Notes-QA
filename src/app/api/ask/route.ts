@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getEmbedding } from "@/lib/embedding";
-import { askQuestion, SourceChunk } from "@/lib/llm";
+import { askQuestion, HistoryTurn, rewriteStandaloneQuestion, SourceChunk } from "@/lib/llm";
 import { query } from "@/lib/db";
 import { normalizeForEmbedding } from "@/lib/text-normalize";
 
@@ -97,19 +97,95 @@ function stripPunctuation(s: string): string {
   return s.replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "");
 }
 
+type QuestionFocus = {
+  topic?: string;
+  aspect?: "advantages" | "disadvantages";
+  aspectWord?: string; // original (e.g. "优点"/"缺点")
+};
+
+function extractFocus(question: string): QuestionFocus {
+  const q = question.trim();
+
+  // Chinese patterns like: "<topic>的优点是什么" / "<topic>缺点有哪些"
+  const m = q.match(/^(.+?)(?:的)?(优点|缺点|好处|坏处)(?:是|有哪些|有什么|分别是什么|是什么|都有哪些)?.*$/);
+  if (m) {
+    const topic = m[1]?.trim();
+    const word = m[2];
+    if (topic && topic.length >= 2) {
+      return {
+        topic,
+        aspect: word === "缺点" || word === "坏处" ? "disadvantages" : "advantages",
+        aspectWord: word,
+      };
+    }
+  }
+
+  // English patterns: "pros/cons/advantages/disadvantages of X"
+  const e = q.match(/\b(advantages|pros|benefits|disadvantages|cons|drawbacks)\b.*?\b(of)\b\s+(.+?)\??$/i);
+  if (e) {
+    const word = e[1].toLowerCase();
+    const topic = e[3]?.trim();
+    return {
+      topic,
+      aspect: /(disadvantages|cons|drawbacks)/.test(word) ? "disadvantages" : "advantages",
+      aspectWord: e[1],
+    };
+  }
+
+  return {};
+}
+
+function clipToFocusedSection(content: string, focus: QuestionFocus): string {
+  if (!focus.topic) return content;
+  const topic = focus.topic;
+  const aspectWord = focus.aspectWord;
+  const text = content.replace(/\r\n/g, "\n");
+
+  const idxTopic = text.indexOf(topic);
+  if (idxTopic < 0) return content;
+
+  // Prefer to clip around aspect ("缺点"/"优点") within the same chunk if present.
+  let idx = idxTopic;
+  if (aspectWord) {
+    const near = text.indexOf(aspectWord, Math.max(0, idxTopic - 200));
+    if (near >= 0) idx = near;
+  }
+
+  const start = Math.max(0, idx - 250);
+  const end = Math.min(text.length, idx + 900);
+  return text.slice(start, end);
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { question } = await req.json();
+    const { question, history } = await req.json();
 
     if (!question || typeof question !== "string" || !question.trim()) {
       return NextResponse.json({ error: "Question is required" }, { status: 400 });
     }
 
+    const safeHistory: HistoryTurn[] = Array.isArray(history)
+      ? history
+          .filter(
+            (t) =>
+              t &&
+              typeof t.question === "string" &&
+              typeof t.answer === "string" &&
+              t.question.trim() &&
+              t.answer.trim()
+          )
+          .slice(-6)
+      : [];
+
+    // Rewrite for retrieval so pronouns like "it/its/他的/它的" become standalone.
+    const retrievalQuestion = await rewriteStandaloneQuestion(question, safeHistory);
+    const focus = extractFocus(retrievalQuestion);
+
     // Embed the question
-    const normalizedQuestion = normalizeForEmbedding(question);
+    const normalizedQuestion = normalizeForEmbedding(retrievalQuestion);
     const queryEmbedding = await getEmbedding(normalizedQuestion);
     const vectorStr = `[${queryEmbedding.join(",")}]`;
-    const rawQ = question.trim();
+    const rawQ = retrievalQuestion.trim();
     const qNoPunct = stripPunctuation(rawQ);
 
     // Search for similar chunks using cosine distance
@@ -139,6 +215,15 @@ export async function POST(req: NextRequest) {
     const threshold = Math.max(BASE_THRESHOLD, topSim - GAP_THRESHOLD);
     let vectorRelevant = vectorRows.filter((row) => row.similarity >= threshold);
     if (vectorRelevant.length < MIN_KEEP) vectorRelevant = vectorRows.slice(0, MIN_KEEP);
+
+    // If we have a clear topic, prefer candidates that mention it.
+    if (focus.topic) {
+      const topic = focus.topic;
+      const focusedVector = vectorRows.filter((row) => row.content.includes(topic));
+      if (focusedVector.length > 0) {
+        vectorRelevant = focusedVector.slice(0, TOP_K);
+      }
+    }
 
     // Keyword-constrained recall boost (hybrid search):
     // If the question contains distinctive tokens (e.g. “审核结果”“准确性”), search those tokens directly
@@ -179,9 +264,11 @@ export async function POST(req: NextRequest) {
       similarity: parseFloat(r.similarity),
     }));
 
-    const patterns = buildKeywordPatterns(question);
+    const patterns = buildKeywordPatterns(retrievalQuestion);
     if (patterns.length > 0) {
-      const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...patterns];
+      const focusLikes =
+        focus.topic && focus.aspectWord ? [`%${focus.topic}%`, `%${focus.aspectWord}%`] : focus.topic ? [`%${focus.topic}%`] : [];
+      const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...focusLikes, ...patterns];
       const where = all.map((_, i) => `c.content ILIKE $${i + 3}`).join(" OR ");
 
       // Exact-hit score + keyword-hit count; then fall back to vector distance.
@@ -227,6 +314,8 @@ export async function POST(req: NextRequest) {
     const scoreExact = (content: string) => {
       const c = content;
       let s = 0;
+      if (focus.topic && c.includes(focus.topic)) s += 6;
+      if (focus.aspectWord && c.includes(focus.aspectWord)) s += 3;
       if (qNoPunct && c.includes(qNoPunct)) s += 2;
       if (rawQ && c.includes(rawQ)) s += 2;
       if (qNoPunct && c.includes(`Q4: ${qNoPunct}`)) s += 6;
@@ -249,13 +338,28 @@ export async function POST(req: NextRequest) {
       similarity: row.similarity,
     }));
 
+    const focusedSources =
+      focus.topic
+        ? sources
+            .filter((s) => s.content.includes(focus.topic!))
+            .map((s) => ({
+              ...s,
+              content: clipToFocusedSection(s.content, focus),
+            }))
+            .slice(0, LLM_TOP_K)
+        : sources.slice(0, LLM_TOP_K);
+
     // Ask LLM with sources
-    const result = await askQuestion(question, sources.slice(0, LLM_TOP_K));
+    const result = await askQuestion(question, focusedSources, {
+      focusTopic: focus.topic,
+      focusAspect: focus.aspectWord,
+    });
 
     return NextResponse.json({
       answer: result.answer,
       sources: result.sources,
       hasAnswer: result.hasAnswer,
+      rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
