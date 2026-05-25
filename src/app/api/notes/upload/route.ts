@@ -4,6 +4,7 @@ import { chunkText } from "@/lib/chunking";
 import { getEmbeddingsBatch } from "@/lib/embedding";
 import { query } from "@/lib/db";
 import { v4 as uuidv4 } from "uuid";
+import { normalizeForEmbedding } from "@/lib/text-normalize";
 
 export async function POST(req: NextRequest) {
   try {
@@ -34,7 +35,8 @@ export async function POST(req: NextRequest) {
           [noteId, file.name, fileType, text]
         );
 
-        // Chunk text
+        // Chunk the ORIGINAL text so start/end offsets match what we display.
+        // Only normalize when generating embeddings (below).
         const chunks = chunkText(text);
 
         if (chunks.length === 0) {
@@ -43,8 +45,13 @@ export async function POST(req: NextRequest) {
         }
 
         // Generate embeddings in batches
-        const chunkTexts = chunks.map((c) => c.content);
-        const embeddings = await getEmbeddingsBatch(chunkTexts);
+        const chunkTextsForEmbedding = chunks.map((c) => {
+          const cleaned = normalizeForEmbedding(c.content);
+          // Add filename context to help retrieval across many notes.
+          const body = cleaned.trim() ? cleaned : c.content;
+          return `${file.name}\n\n${body}`;
+        });
+        const embeddings = await getEmbeddingsBatch(chunkTextsForEmbedding);
 
         // Insert chunks with embeddings
         for (let i = 0; i < chunks.length; i++) {

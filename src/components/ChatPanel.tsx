@@ -72,8 +72,19 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const renderAnswer = (text: string) => {
     if (!text) return null;
 
+    // Light cleanup: if model outputs markdown markers, hide them rather than showing raw '*'.
+    // (We still rely on citations like [1] to be clickable.)
+    const cleaned = text
+      .replace(/\r\n/g, "\n")
+      .replace(/^\s*[-*+]\s+/gm, "")
+      .replace(/^\s*\d+\.\s+/gm, "")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/\*([^*]+)\*/g, "$1")
+      .replace(/__([^_]+)__/g, "$1")
+      .replace(/_([^_]+)_/g, "$1");
+
     // Split by citation patterns like [1], [2], [1][3] etc.
-    const parts = text.split(/(\[\d+\])/g);
+    const parts = cleaned.split(/(\[\d+\])/g);
 
     return parts.map((part, i) => {
       const citationMatch = part.match(/^\[(\d+)\]$/);

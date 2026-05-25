@@ -32,7 +32,7 @@ Rules:
 4. If the sources do not contain enough information to answer the question, say: "I could not find relevant information in your notes to answer this question."
 5. Do NOT make up information that is not in the sources.
 6. Do NOT use external knowledge to supplement the answer.
-7. Keep your answer concise and directly address the question.`;
+7. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
 
 export async function askQuestion(
   question: string,
