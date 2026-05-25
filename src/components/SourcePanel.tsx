@@ -31,6 +31,16 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   const [expandedNote, setExpandedNote] = useState<string | null>(null);
   const [noteDetail, setNoteDetail] = useState<NoteDetail | null>(null);
 
+  const loadNoteDetail = useCallback(async (noteId: string) => {
+    try {
+      const res = await fetch(`/api/notes/${noteId}`);
+      const data = await res.json();
+      setNoteDetail(data);
+    } catch (err) {
+      console.error("Failed to load note detail:", err);
+    }
+  }, []);
+
   const fetchNotes = useCallback(async () => {
     try {
       const res = await fetch("/api/notes");
@@ -42,25 +52,17 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchNotes();
   }, [fetchNotes, refreshKey]);
 
   useEffect(() => {
     if (highlight?.noteId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setExpandedNote(highlight.noteId);
       loadNoteDetail(highlight.noteId);
     }
-  }, [highlight]);
-
-  const loadNoteDetail = async (noteId: string) => {
-    try {
-      const res = await fetch(`/api/notes/${noteId}`);
-      const data = await res.json();
-      setNoteDetail(data);
-    } catch (err) {
-      console.error("Failed to load note detail:", err);
-    }
-  };
+  }, [highlight, loadNoteDetail]);
 
   const toggleNote = (noteId: string) => {
     if (expandedNote === noteId) {

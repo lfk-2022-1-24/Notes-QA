@@ -2,14 +2,6 @@
 
 import { useState, useCallback } from "react";
 
-interface Note {
-  id: string;
-  filename: string;
-  file_type: string;
-  created_at: string;
-  chunk_count: string;
-}
-
 interface UploadZoneProps {
   onUploadComplete: () => void;
 }
