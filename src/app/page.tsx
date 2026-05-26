@@ -10,6 +10,7 @@ interface HighlightRange {
   startChar: number;
   endChar: number;
   anchorText?: string;
+  queryText?: string;
 }
 
 export default function Home() {

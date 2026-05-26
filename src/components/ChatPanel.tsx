@@ -17,6 +17,7 @@ interface HighlightRange {
   startChar: number;
   endChar: number;
   anchorText?: string;
+  queryText?: string;
 }
 
 interface ChatPanelProps {
@@ -45,6 +46,16 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  const buildAnchorText = (sourceContent: string): string => {
+    // Use a mid-slice to reduce collisions on generic headings/preambles.
+    if (!sourceContent) return "";
+    const text = sourceContent.trim();
+    if (text.length <= 260) return text;
+    const mid = Math.floor(text.length / 2);
+    const start = Math.max(0, mid - 130);
+    return text.slice(start, start + 260);
+  };
 
   const extractCitedSourceIndices = (answerText: string): Set<number> => {
     const set = new Set<number>();
@@ -176,7 +187,7 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
     }
   };
 
-  const renderAnswer = (text: string, msgSources: Source[]) => {
+  const renderAnswer = (text: string, msgSources: Source[], queryText: string) => {
     if (!text) return null;
 
     // Light cleanup: if model outputs markdown markers, hide them rather than showing raw '*'.
@@ -207,7 +218,8 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                   noteId: source.noteId,
                   startChar: source.startChar,
                   endChar: source.endChar,
-                  anchorText: source.content.slice(0, 600),
+                  anchorText: buildAnchorText(source.content),
+                  queryText,
                 })
               }
               className="inline-flex items-center px-1 py-0.5 text-xs font-medium bg-blue-100 text-blue-700 rounded hover:bg-blue-200 cursor-pointer"
@@ -283,7 +295,7 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                 }`}
               >
                 <div className="prose prose-sm max-w-none text-gray-800 leading-relaxed">
-                  {renderAnswer(m.answer, m.sources)}
+                  {renderAnswer(m.answer, m.sources, m.question)}
                 </div>
                 {!m.hasAnswer && (
                   <div className="mt-2 text-xs text-amber-600">
@@ -314,7 +326,8 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
                         noteId: source.noteId,
                         startChar: source.startChar,
                         endChar: source.endChar,
-                        anchorText: source.content.slice(0, 600),
+                        anchorText: buildAnchorText(source.content),
+                        queryText: m.question,
                       })
                     }
                   >

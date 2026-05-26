@@ -20,6 +20,7 @@ interface HighlightRange {
   startChar: number;
   endChar: number;
   anchorText?: string;
+  queryText?: string;
 }
 
 interface SourcePanelProps {
@@ -111,23 +112,54 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
     }
   };
 
+  const extractQueryTokens = (q: string): string[] => {
+    const text = (q || "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, " ");
+    if (!text) return [];
+    const stop = new Set([
+      "什么",
+      "为什么",
+      "怎么",
+      "如何",
+      "是不是",
+      "是否",
+      "需要",
+      "应该",
+      "的",
+      "吗",
+      "it",
+      "they",
+      "this",
+      "that",
+    ]);
+    const toks = new Set<string>();
+    for (const m of text.matchAll(/[\p{Script=Han}A-Za-z0-9]{2,}/gu)) {
+      const t = m[0];
+      if (!t || stop.has(t)) continue;
+      toks.add(t);
+    }
+    return Array.from(toks).sort((a, b) => b.length - a.length).slice(0, 8);
+  };
+
+  const countTokenHits = (haystack: string, tokens: string[]): number => {
+    if (tokens.length === 0) return 0;
+    let hits = 0;
+    for (const t of tokens) {
+      if (haystack.includes(t)) hits++;
+    }
+    return hits;
+  };
+
   const renderHighlightedContent = (content: string) => {
-    if (!highlight) return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
+    // Only highlight inside the cited note. Prevents unrelated highlights
+    // when user expands other notes while a highlight is still active.
+    if (!highlight || highlight.noteId !== noteDetail?.note.id) {
+      return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
+    }
 
     let { startChar, endChar } = highlight;
-
-    // Prefer anchorText alignment even when offsets look valid.
-    // This makes TXT/large notes robust when stored offsets drift.
-    if (highlight.anchorText) {
-      const anchor = highlight.anchorText.trim().slice(0, 260);
-      if (anchor.length >= 20) {
-        const idx = content.indexOf(anchor);
-        if (idx >= 0) {
-          startChar = idx;
-          endChar = Math.min(content.length, idx + anchor.length);
-        }
-      }
-    }
 
     const isRangeValid =
       Number.isFinite(startChar) &&
@@ -135,6 +167,38 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
       startChar >= 0 &&
       endChar > startChar &&
       endChar <= content.length;
+
+    // Stronger anchor alignment:
+    // - only search for anchor within a window around the provided offsets (or start of doc as fallback)
+    // - require the matched location to contain at least one query token (prevents unrelated matches)
+    if (highlight.anchorText) {
+      const anchor = highlight.anchorText.trim().slice(0, 260);
+      if (anchor.length >= 24) {
+        const tokens = extractQueryTokens(highlight.queryText || "");
+        const center = isRangeValid ? Math.floor((startChar + endChar) / 2) : 0;
+        const winStart = Math.max(0, center - 3000);
+        const winEnd = Math.min(content.length, center + 3000);
+        const windowText = content.slice(winStart, winEnd);
+
+        const localIdx = windowText.indexOf(anchor);
+        if (localIdx >= 0) {
+          const absIdx = winStart + localIdx;
+          const localSecond = windowText.indexOf(anchor, localIdx + 1);
+          const uniqueInWindow = localSecond < 0;
+
+          // Verify token hits around match.
+          const verifyStart = Math.max(0, absIdx - 200);
+          const verifyEnd = Math.min(content.length, absIdx + anchor.length + 600);
+          const verifyText = content.slice(verifyStart, verifyEnd);
+          const okByTokens = tokens.length === 0 ? true : countTokenHits(verifyText, tokens) >= 1;
+
+          if (uniqueInWindow && okByTokens) {
+            startChar = absIdx;
+            endChar = Math.min(content.length, absIdx + anchor.length);
+          }
+        }
+      }
+    }
 
     if (!Number.isFinite(startChar) || startChar < 0) startChar = 0;
     if (!Number.isFinite(endChar) || endChar <= startChar) endChar = Math.min(content.length, startChar + 200);
