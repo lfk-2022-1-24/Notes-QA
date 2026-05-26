@@ -193,8 +193,11 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
           const okByTokens = tokens.length === 0 ? true : countTokenHits(verifyText, tokens) >= 1;
 
           if (uniqueInWindow && okByTokens) {
+            // Only adjust the start position; preserve the intended highlight length
+            // from backend to avoid over-highlighting for docx/doc paragraphs.
+            const len = Number.isFinite(endChar) && Number.isFinite(startChar) ? Math.max(40, endChar - startChar) : anchor.length;
             startChar = absIdx;
-            endChar = Math.min(content.length, absIdx + anchor.length);
+            endChar = Math.min(content.length, absIdx + Math.min(anchor.length, len));
           }
         }
       }
@@ -202,6 +205,8 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
 
     if (!Number.isFinite(startChar) || startChar < 0) startChar = 0;
     if (!Number.isFinite(endChar) || endChar <= startChar) endChar = Math.min(content.length, startChar + 200);
+    // Final UI safeguard: never highlight an overly large span.
+    if (endChar - startChar > 220) endChar = startChar + 220;
     if (startChar >= content.length) return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
 
     const before = content.slice(0, startChar);

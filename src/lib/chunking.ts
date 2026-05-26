@@ -104,7 +104,16 @@ export function chunkText(text: string): Chunk[] {
 
   // Re-index positions based on actual content positions
   return chunks.map((chunk) => {
-    const actualStart = text.indexOf(chunk.content.slice(0, 50), chunk.startChar - 10 > 0 ? chunk.startChar - 10 : 0);
+    // The initial startChar is derived from paragraph scanning, which should already be close.
+    // When the document contains repeated headings/phrases (common in docx exports),
+    // a global-ish indexOf can jump to a different repeated section and break source highlighting.
+    // Therefore, only search within a small local window around the expected start.
+    const needle = chunk.content.slice(0, 50);
+    const expected = Math.max(0, chunk.startChar);
+    const windowStart = Math.max(0, expected - 200);
+    const windowEnd = Math.min(text.length, expected + 2000);
+    const localIdx = text.slice(windowStart, windowEnd).indexOf(needle);
+    const actualStart = localIdx >= 0 ? windowStart + localIdx : -1;
     return {
       ...chunk,
       startChar: actualStart >= 0 ? actualStart : chunk.startChar,

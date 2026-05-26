@@ -97,6 +97,20 @@ function stripPunctuation(s: string): string {
   return s.replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "");
 }
 
+function normalizeLooseContains(s: string): string {
+  return (s || "")
+    .replace(/\s+/g, "")
+    .replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "")
+    .toLowerCase();
+}
+
+function includesLoose(haystack: string, needle: string): boolean {
+  const n = normalizeLooseContains(needle);
+  if (!n) return false;
+  const h = normalizeLooseContains(haystack);
+  return h.includes(n);
+}
+
 type QuestionFocus = {
   topic?: string;
   aspect?: "advantages" | "disadvantages";
@@ -126,6 +140,20 @@ function extractDefinitionTopic(question: string): string | null {
   return null;
 }
 
+function hasDefinitionCue(content: string, topic: string): boolean {
+  const c = normalizeLooseContains(content);
+  const t = normalizeLooseContains(topic);
+  if (!t) return false;
+
+  // Direct definition patterns
+  if (c.includes(`${t}是`) || c.includes(`${t}指`) || c.includes(`${t}意味着`)) return true;
+  if (c.includes(`什么是${t}`) || c.includes(`${t}是什么`)) return true;
+
+  // Meta definition cues (common in docx/notes)
+  if (c.includes("定义") || c.includes("含义") || c.includes("内涵") || c.includes("解释") || c.includes("概念")) return true;
+  return false;
+}
+
 function refineRangeByDefinitionTopic(
   chunkContent: string,
   chunkStartAbs: number,
@@ -151,24 +179,19 @@ function refineRangeByDefinitionTopic(
   }
   if (idx < 0) return null;
 
-  // Start at line boundary.
-  const prevNl = text.lastIndexOf("\n", idx);
-  let startIdx = prevNl >= 0 ? prevNl + 1 : 0;
+  // For definition-style queries, prefer a sentence-level highlight around "X是/指/意味着"
+  // rather than a whole paragraph (docx paragraphs can be long).
+  const matchIdx = (() => {
+    const candidates = [`${t}是`, `${t}指`, `${t}意味着`];
+    for (const c of candidates) {
+      const i = text.indexOf(c, idx);
+      if (i >= 0) return i;
+    }
+    const any = text.indexOf(t, idx);
+    return any >= 0 ? any : idx;
+  })();
 
-  // End at next heading-like boundary, else next paragraph break, else a max window.
-  let endIdx = Math.min(text.length, startIdx + 1200);
-  const after = startIdx + 1;
-
-  const nextMdHeading = text.slice(after).search(/\n\s*#{1,6}\s+\S+/);
-  if (nextMdHeading >= 0) endIdx = Math.min(endIdx, after + nextMdHeading);
-
-  const para = text.slice(after, endIdx).search(/\n\s*\n/);
-  if (para >= 0 && para < 900) endIdx = Math.min(endIdx, after + para);
-
-  // Ensure we include body content beyond the title line.
-  if (endIdx - startIdx < 120) endIdx = Math.min(text.length, startIdx + 500);
-
-  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+  const { startIdx, endIdx } = getSentenceBounds(text, matchIdx, { maxLen: 220 });
   const snippet = text.slice(startIdx, endIdx);
   if (!snippet.trim()) return null;
 
@@ -376,6 +399,128 @@ function findBestKeywordMatchIndex(text: string, tokens: string[]): number | nul
   return bestIdx;
 }
 
+function getTightBounds(text: string, matchIdx: number): { startIdx: number; endIdx: number } {
+  const t = text;
+  const idx = Math.max(0, Math.min(matchIdx, t.length));
+
+  // Prefer paragraph bounds (docx/raw text uses double newlines per paragraph).
+  const paraSep = /\n\s*\n/;
+  const before = t.slice(0, idx);
+  const after = t.slice(idx);
+
+  const prevPara = before.lastIndexOf("\n\n");
+  let paraStart = prevPara >= 0 ? prevPara + 2 : 0;
+  const nextParaRel = after.search(paraSep);
+  let paraEnd = nextParaRel >= 0 ? idx + nextParaRel : t.length;
+
+  // If paragraph is too long, fall back to sentence-ish bounds.
+  const paraLen = paraEnd - paraStart;
+  if (paraLen > 480) {
+    // Sentence punctuation boundaries (CN + EN) or line breaks.
+    const sentStops = /[。！？!?；;]\s|\n/;
+    // Find sentence start
+    let sStart = Math.max(0, idx - 1);
+    while (sStart > 0) {
+      const c = t[sStart - 1]!;
+      if (c === "\n") break;
+      if (/[。！？!?；;]/.test(c)) break;
+      sStart--;
+      if (idx - sStart > 260) break;
+    }
+    // Find sentence end
+    let sEnd = idx;
+    while (sEnd < t.length) {
+      const c = t[sEnd]!;
+      if (c === "\n" || /[。！？!?；;]/.test(c)) {
+        sEnd++;
+        break;
+      }
+      sEnd++;
+      if (sEnd - idx > 320) break;
+    }
+
+    // Ensure minimum length
+    if (sEnd - sStart < 60) {
+      sStart = Math.max(0, idx - 140);
+      sEnd = Math.min(t.length, idx + 260);
+    }
+    return { startIdx: sStart, endIdx: sEnd };
+  }
+
+  // Trim surrounding whitespace.
+  while (paraStart < paraEnd && (t[paraStart] === "\n" || t[paraStart] === " ")) paraStart++;
+  while (paraEnd > paraStart && /\s/.test(t[paraEnd - 1]!)) paraEnd--;
+
+  // Keep at least a small window.
+  if (paraEnd - paraStart < 40) {
+    const s = Math.max(0, idx - 140);
+    const e = Math.min(t.length, idx + 260);
+    return { startIdx: s, endIdx: e };
+  }
+
+  return { startIdx: paraStart, endIdx: paraEnd };
+}
+
+function getSentenceBounds(
+  text: string,
+  matchIdx: number,
+  opts?: { maxLen?: number }
+): { startIdx: number; endIdx: number } {
+  const t = text;
+  const idx = Math.max(0, Math.min(matchIdx, t.length));
+  const maxLen = opts?.maxLen ?? 280;
+  const softLen = Math.min(maxLen, 170);
+
+  // Expand to nearest punctuation / newline boundaries.
+  let start = idx;
+  while (start > 0) {
+    const c = t[start - 1]!;
+    if (c === "\n") break;
+    if (/[。！？!?；;]/.test(c)) break;
+    start--;
+    if (idx - start > Math.floor(maxLen * 0.6)) break;
+  }
+
+  let end = idx;
+  while (end < t.length) {
+    const c = t[end]!;
+    if (c === "\n" || /[。！？!?；;]/.test(c)) {
+      end++;
+      break;
+    }
+    end++;
+    if (end - start > maxLen) break;
+  }
+
+  // If the sentence is still long, try to cut at a comma near softLen.
+  if (end - start > softLen) {
+    const window = t.slice(start, Math.min(t.length, start + maxLen));
+    const hardStop = window.search(/[。！？!?；;\n]/);
+    if (hardStop >= 0 && hardStop >= 30) {
+      end = start + hardStop + 1;
+    } else {
+      const commaIdx = window.slice(0, softLen + 60).search(/[，,]/);
+      if (commaIdx >= 0 && commaIdx >= 60) {
+        end = start + commaIdx + 1;
+      } else {
+        end = Math.min(t.length, start + softLen);
+      }
+    }
+  }
+
+  // Minimum window
+  if (end - start < 60) {
+    start = Math.max(0, idx - 140);
+    end = Math.min(t.length, idx + 220);
+  }
+
+  // Trim whitespace
+  while (start < end && (t[start] === "\n" || t[start] === " ")) start++;
+  while (end > start && /\s/.test(t[end - 1]!)) end--;
+
+  return { startIdx: start, endIdx: end };
+}
+
 function getAllQuestionHeaderPositions(text: string): number[] {
   const headers: number[] = [];
   const patterns: RegExp[] = [
@@ -441,12 +586,13 @@ function refineRangeByQuestionMatch(
   // Try to bound by nearest question header before the match, and next header after it.
   const headers = getAllLikelyQuestionHeaderPositions(text);
   if (headers.length < 2) {
-    // Not a numbered Q/A style chunk; fall back to a small window around match.
-    const start = Math.max(0, matchIdx - 140);
-    const end = Math.min(text.length, matchIdx + 520);
-    const snippet = text.slice(start, end).trim();
-    if (!snippet) return null;
-    return { content: snippet, startChar: chunkStartAbs + start, endChar: chunkStartAbs + end };
+    // Not a numbered Q/A style chunk; tighten around match.
+    // If we only have 1 token (often very generic, like "诚信"), prefer sentence-level to avoid huge highlights.
+    const { startIdx, endIdx } =
+      tokens.length <= 1 ? getSentenceBounds(text, matchIdx, { maxLen: 320 }) : getTightBounds(text, matchIdx);
+    const snippet = text.slice(startIdx, endIdx);
+    if (!snippet.trim()) return null;
+    return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
   }
   let startIdx = 0;
   for (const h of headers) {
@@ -472,20 +618,21 @@ function refineRangeByQuestionMatch(
   const para = text.slice(startIdx + 1, endIdx).search(/\n\s*\n/);
   if (para >= 0 && para < 900) endIdx = startIdx + 1 + para;
 
-  // Trim end whitespace.
-  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
-  // Keep at least a small window.
-  if (endIdx - startIdx < 40) {
-    endIdx = Math.min(text.length, startIdx + 200);
-  }
+  // Tighten within the block to the most relevant paragraph/sentence around the match.
+  const tight =
+    tokens.length <= 1
+      ? getSentenceBounds(text.slice(startIdx, endIdx), matchIdx - startIdx, { maxLen: 320 })
+      : getTightBounds(text.slice(startIdx, endIdx), matchIdx - startIdx);
+  const tightStart = startIdx + tight.startIdx;
+  const tightEnd = startIdx + tight.endIdx;
 
-  const snippet = text.slice(startIdx, endIdx);
+  const snippet = text.slice(tightStart, tightEnd);
   if (!snippet.trim()) return null;
 
   return {
     content: snippet,
-    startChar: chunkStartAbs + startIdx,
-    endChar: chunkStartAbs + endIdx,
+    startChar: chunkStartAbs + tightStart,
+    endChar: chunkStartAbs + tightEnd,
   };
 }
 
@@ -573,38 +720,48 @@ export async function POST(req: NextRequest) {
 
     // Embed the question
     const normalizedQuestion = normalizeForEmbedding(retrievalQuestion);
-    const queryEmbedding = await getEmbedding(normalizedQuestion);
-    const vectorStr = `[${queryEmbedding.join(",")}]`;
+    let vectorStr: string | null = null;
+    try {
+      const queryEmbedding = await getEmbedding(normalizedQuestion);
+      vectorStr = `[${queryEmbedding.join(",")}]`;
+    } catch (e) {
+      // If embedding service is down, fall back to keyword-only retrieval.
+      console.warn("Embedding failed, falling back to keyword-only retrieval:", e instanceof Error ? e.message : e);
+      vectorStr = null;
+    }
     const rawQ = retrievalQuestion.trim();
     const qNoPunct = stripPunctuation(rawQ);
 
-    // Search for similar chunks using cosine distance
-    const searchResult = await query(
-      `SELECT
-        c.id,
-        c.note_id,
-        c.content,
-        c.start_char,
-        c.end_char,
-        n.filename,
-        1 - (c.embedding <=> $1::vector) AS similarity
-      FROM chunks c
-      JOIN notes n ON n.id = c.note_id
-      ORDER BY c.embedding <=> $1::vector
-      LIMIT $2`,
-      [vectorStr, TOP_K]
-    );
+    let vectorRows: SearchRow[] = [];
+    if (vectorStr) {
+      // Search for similar chunks using cosine distance
+      const searchResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          1 - (c.embedding <=> $1::vector) AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        ORDER BY c.embedding <=> $1::vector
+        LIMIT $2`,
+        [vectorStr, TOP_K]
+      );
 
-    const vectorRows: SearchRow[] = searchResult.rows.map((r) => ({
-      ...(r as Omit<SearchRow, "similarity">),
-      similarity: parseFloat(r.similarity),
-    }));
+      vectorRows = searchResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
 
     // Filter vector results with an adaptive threshold.
     const topSim = vectorRows[0]?.similarity ?? 0;
     const threshold = Math.max(BASE_THRESHOLD, topSim - GAP_THRESHOLD);
     let vectorRelevant = vectorRows.filter((row) => row.similarity >= threshold);
-    if (vectorRelevant.length < MIN_KEEP) vectorRelevant = vectorRows.slice(0, MIN_KEEP);
+    if (vectorStr && vectorRelevant.length < MIN_KEEP) vectorRelevant = vectorRows.slice(0, MIN_KEEP);
 
     // If we have a clear topic, prefer candidates that mention it.
     if (focus.topic) {
@@ -627,27 +784,49 @@ export async function POST(req: NextRequest) {
     ];
 
     // Exact phrase match is the most reliable for Q/A style notes.
-    const exactResult = await query(
-      `SELECT
-        c.id,
-        c.note_id,
-        c.content,
-        c.start_char,
-        c.end_char,
-        n.filename,
-        1 - (c.embedding <=> $1::vector) AS similarity
-      FROM chunks c
-      JOIN notes n ON n.id = c.note_id
-      WHERE c.content ILIKE $3 OR c.content ILIKE $4 OR c.content ILIKE $5 OR c.content ILIKE $6
-      ORDER BY
-        ((CASE WHEN c.content ILIKE $3 THEN 1 ELSE 0 END) +
-         (CASE WHEN c.content ILIKE $4 THEN 1 ELSE 0 END) +
-         (CASE WHEN c.content ILIKE $5 THEN 1 ELSE 0 END) +
-         (CASE WHEN c.content ILIKE $6 THEN 1 ELSE 0 END)) DESC,
-        c.embedding <=> $1::vector
-      LIMIT $2`,
-      [vectorStr, KEYWORD_K, ...exactLikes]
-    );
+    const exactResult = vectorStr
+      ? await query(
+          `SELECT
+            c.id,
+            c.note_id,
+            c.content,
+            c.start_char,
+            c.end_char,
+            n.filename,
+            1 - (c.embedding <=> $1::vector) AS similarity
+          FROM chunks c
+          JOIN notes n ON n.id = c.note_id
+          WHERE c.content ILIKE $3 OR c.content ILIKE $4 OR c.content ILIKE $5 OR c.content ILIKE $6
+          ORDER BY
+            ((CASE WHEN c.content ILIKE $3 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $4 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $5 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $6 THEN 1 ELSE 0 END)) DESC,
+            c.embedding <=> $1::vector
+          LIMIT $2`,
+          [vectorStr, KEYWORD_K, ...exactLikes]
+        )
+      : await query(
+          `SELECT
+            c.id,
+            c.note_id,
+            c.content,
+            c.start_char,
+            c.end_char,
+            n.filename,
+            0.0 AS similarity
+          FROM chunks c
+          JOIN notes n ON n.id = c.note_id
+          WHERE c.content ILIKE $1 OR c.content ILIKE $2 OR c.content ILIKE $3 OR c.content ILIKE $4
+          ORDER BY
+            ((CASE WHEN c.content ILIKE $1 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $2 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $3 THEN 1 ELSE 0 END) +
+             (CASE WHEN c.content ILIKE $4 THEN 1 ELSE 0 END)) DESC,
+            c.id
+          LIMIT $5`,
+          [...exactLikes, KEYWORD_K]
+        );
 
     const exactRows: SearchRow[] = exactResult.rows.map((r) => ({
       ...(r as Omit<SearchRow, "similarity">),
@@ -659,31 +838,51 @@ export async function POST(req: NextRequest) {
       const focusLikes =
         focus.topic && focus.aspectWord ? [`%${focus.topic}%`, `%${focus.aspectWord}%`] : focus.topic ? [`%${focus.topic}%`] : [];
       const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...focusLikes, ...patterns];
-      const where = all.map((_, i) => `c.content ILIKE $${i + 3}`).join(" OR ");
+      const whereOffset = vectorStr ? 3 : 2; // $1 is vector (when present), $1 is LIMIT otherwise
+      const where = all.map((_, i) => `c.content ILIKE $${i + whereOffset}`).join(" OR ");
 
       // Exact-hit score + keyword-hit count; then fall back to vector distance.
       const exactHit =
-        `((CASE WHEN c.content ILIKE $3 THEN 1 ELSE 0 END) + (CASE WHEN c.content ILIKE $4 THEN 1 ELSE 0 END))`;
+        `((CASE WHEN c.content ILIKE $${whereOffset} THEN 1 ELSE 0 END) + (CASE WHEN c.content ILIKE $${
+          whereOffset + 1
+        } THEN 1 ELSE 0 END))`;
       const kwHits = all
-        .map((_, i) => `CASE WHEN c.content ILIKE $${i + 3} THEN 1 ELSE 0 END`)
+        .map((_, i) => `CASE WHEN c.content ILIKE $${i + whereOffset} THEN 1 ELSE 0 END`)
         .join(" + ");
 
-      const keywordResult = await query(
-        `SELECT
-          c.id,
-          c.note_id,
-          c.content,
-          c.start_char,
-          c.end_char,
-          n.filename,
-          1 - (c.embedding <=> $1::vector) AS similarity
-        FROM chunks c
-        JOIN notes n ON n.id = c.note_id
-        WHERE ${where}
-        ORDER BY ${exactHit} DESC, (${kwHits}) DESC, c.embedding <=> $1::vector
-        LIMIT $2`,
-        [vectorStr, KEYWORD_K, ...all]
-      );
+      const keywordResult = vectorStr
+        ? await query(
+            `SELECT
+              c.id,
+              c.note_id,
+              c.content,
+              c.start_char,
+              c.end_char,
+              n.filename,
+              1 - (c.embedding <=> $1::vector) AS similarity
+            FROM chunks c
+            JOIN notes n ON n.id = c.note_id
+            WHERE ${where}
+            ORDER BY ${exactHit} DESC, (${kwHits}) DESC, c.embedding <=> $1::vector
+            LIMIT $2`,
+            [vectorStr, KEYWORD_K, ...all]
+          )
+        : await query(
+            `SELECT
+              c.id,
+              c.note_id,
+              c.content,
+              c.start_char,
+              c.end_char,
+              n.filename,
+              0.0 AS similarity
+            FROM chunks c
+            JOIN notes n ON n.id = c.note_id
+            WHERE ${where}
+            ORDER BY ${exactHit} DESC, (${kwHits}) DESC, c.id
+            LIMIT $1`,
+            [KEYWORD_K, ...all]
+          );
       keywordRows = keywordResult.rows.map((r) => ({
         ...(r as Omit<SearchRow, "similarity">),
         similarity: parseFloat(r.similarity),
@@ -704,10 +903,10 @@ export async function POST(req: NextRequest) {
     const scoreExact = (content: string) => {
       const c = content;
       let s = 0;
-      if (focus.topic && c.includes(focus.topic)) s += 6;
-      if (focus.aspectWord && c.includes(focus.aspectWord)) s += 3;
-      if (defTopic && c.includes(defTopic)) s += 4;
-      if (defTopic && c.includes(`${defTopic}是`)) s += 6;
+      if (focus.topic && includesLoose(c, focus.topic)) s += 6;
+      if (focus.aspectWord && includesLoose(c, focus.aspectWord)) s += 3;
+      if (defTopic && includesLoose(c, defTopic)) s += 4;
+      if (defTopic && includesLoose(c, `${defTopic}是`)) s += 6;
       if (defTopic && (c.includes("目的") || c.includes("作用") || c.includes("用于"))) s += 2;
       if (qNoPunct && c.includes(qNoPunct)) s += 2;
       if (rawQ && c.includes(rawQ)) s += 2;
@@ -737,9 +936,27 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    const focusedSources = focus.topic
-      ? baseSources.filter((s) => s.content.includes(focus.topic!)).slice(0, LLM_TOP_K)
-      : baseSources.slice(0, LLM_TOP_K);
+    // Pick LLM sources.
+    // - If focus.topic exists, keep only those mentioning the topic.
+    // - If the question is a definition ("X是什么"), prefer sources that mention X to avoid unrelated chunks.
+    const focusedSources = (() => {
+      if (focus.topic) {
+        const arr = baseSources.filter((s) => includesLoose(s.content, focus.topic!));
+        return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
+      }
+
+      if (defTopic) {
+        const byTopic = baseSources.filter((s) => includesLoose(s.content, defTopic));
+        const byDefinition = byTopic.filter((s) => hasDefinitionCue(s.content, defTopic));
+        const picked = (byDefinition.length > 0 ? byDefinition : byTopic.length > 0 ? byTopic : baseSources).slice(
+          0,
+          LLM_TOP_K
+        );
+        return picked;
+      }
+
+      return baseSources.slice(0, LLM_TOP_K);
+    })();
 
     // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
     const uiSources: SourceChunk[] = focusedSources.map((s) => {
@@ -767,9 +984,19 @@ export async function POST(req: NextRequest) {
       return s;
     });
 
+    // For definition-style questions, also clip the LLM context to the definition sentence/snippet.
+    // This prevents the model from citing adjacent, unrelated concepts in the same long paragraph.
+    const llmSources: SourceChunk[] =
+      defTopic
+        ? focusedSources.map((s) => {
+            const refined = refineRangeByDefinitionTopic(s.content, 0, defTopic);
+            return refined ? { ...s, content: refined.content } : s;
+          })
+        : focusedSources;
+
     // Ask LLM with sources
-    const result = await askQuestion(question, focusedSources, {
-      focusTopic: focus.topic,
+    const result = await askQuestion(question, llmSources, {
+      focusTopic: focus.topic ?? defTopic ?? undefined,
       focusAspect: focus.aspectWord,
     });
 

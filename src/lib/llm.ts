@@ -6,6 +6,7 @@ const deepseekClient = new OpenAI({
 });
 
 const CHAT_MODEL = process.env.DEEPSEEK_CHAT_MODEL || "deepseek-v4-pro";
+const LLM_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_TIMEOUT_MS || "20000");
 
 export interface SourceChunk {
   index: number;
@@ -141,15 +142,18 @@ export async function askQuestion(
 
   const userMessage = `${focusLine}Here are the source notes:\n\n${sourceText}\n\n---\n\nQuestion: ${question}`;
 
-  const response = await deepseekClient.chat.completions.create({
-    model: CHAT_MODEL,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userMessage },
-    ],
-    temperature: 0.1,
-    max_tokens: 2048,
-  });
+  const response = await deepseekClient.chat.completions.create(
+    {
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userMessage },
+      ],
+      temperature: 0.1,
+      max_tokens: 2048,
+    },
+    { timeout: LLM_TIMEOUT_MS }
+  );
 
   const answer = response.choices[0]?.message?.content || "";
 

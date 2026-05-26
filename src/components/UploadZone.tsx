@@ -87,7 +87,7 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
           id="file-input"
           type="file"
           multiple
-          accept=".md,.txt,.pdf"
+          accept=".md,.txt,.pdf,.docx,.doc"
           className="hidden"
           onChange={handleFileSelect}
         />
@@ -105,7 +105,7 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
               Drop files here or click to upload
             </p>
             <p className="text-gray-400 text-sm mt-1">
-              Supports .md, .txt, .pdf
+              Supports .md, .txt, .pdf, .docx, .doc
             </p>
           </div>
         )}
