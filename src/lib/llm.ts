@@ -47,7 +47,8 @@ Rules:
 4. If the sources do not contain enough information to answer the question, output EXACTLY: "__NO_RELEVANT_INFO__"
 5. Do NOT make up information that is not in the sources.
 6. Do NOT use external knowledge to supplement the answer.
-7. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
+7. If the sources contain suggested phrasing, example replies, or a recommended way to respond, include that wording.
+8. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
 
 const REWRITE_SYSTEM_PROMPT = `You rewrite a user's question into a standalone question using chat history.
 

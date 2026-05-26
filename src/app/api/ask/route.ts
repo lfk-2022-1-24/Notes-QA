@@ -151,6 +151,49 @@ function includesLoose(haystack: string, needle: string): boolean {
   return h.includes(n);
 }
 
+function trimLeadingToBoldHeading(
+  snippet: string,
+  preferredToken?: string
+): { snippet: string; delta: number } {
+  // Fix "highlight drift upward" when multiple items are flattened into one line.
+  // Example: `2. ... **常用的分库分表策略**： ...` should start from the bold heading, not the previous list item.
+  if (!snippet) return { snippet, delta: 0 };
+  const matches: { idx: number; title: string }[] = [];
+  for (const m of snippet.matchAll(/\*\*([^*\n]{2,80})\*\*/g)) {
+    if (m.index === undefined) continue;
+    matches.push({ idx: m.index, title: (m[1] || "").trim() });
+    if (matches.length >= 12) break;
+  }
+  if (matches.length === 0) return { snippet, delta: 0 };
+
+  const looksLikeDriftPrefix = (prefix: string) =>
+    /\b\d{1,4}\s*[.．、)]\s+\S/.test(prefix) || prefix.trim().length >= 12;
+
+  const pickIdx = (() => {
+    // Prefer a bold heading that matches the user's main token, but only when it appears after a drift-y prefix.
+    if (preferredToken) {
+      for (const it of matches) {
+        if (it.idx <= 0) continue;
+        const prefix = snippet.slice(0, it.idx);
+        if (!looksLikeDriftPrefix(prefix)) continue;
+        if (includesLoose(it.title, preferredToken)) return it.idx;
+      }
+    }
+    // Fallback: first bold heading after a drift-y prefix.
+    for (const it of matches) {
+      if (it.idx <= 0) continue;
+      const prefix = snippet.slice(0, it.idx);
+      if (looksLikeDriftPrefix(prefix)) return it.idx;
+    }
+    return null;
+  })();
+
+  if (pickIdx === null) return { snippet, delta: 0 };
+  const out = snippet.slice(pickIdx);
+  if (!out.trim()) return { snippet, delta: 0 };
+  return { snippet: out, delta: pickIdx };
+}
+
 function buildLfTextAndMap(orig: string): { text: string; map: number[] } {
   // Normalize CRLF -> LF for matching/regex, while keeping a mapping to original indices.
   // map[normIndex] = origIndex
@@ -1044,9 +1087,20 @@ function refineRangeByMarkdownLineMatch(
 
   const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
   let snippet = chunkContent.slice(mapped.start, mapped.end);
+  // If the line was flattened and includes prior numbered items, prefer starting from the first bold heading.
+  {
+    const trimmed = trimLeadingToBoldHeading(snippet, mainToken);
+    if (trimmed.delta > 0) {
+      snippet = trimmed.snippet;
+      mapped.start = mapped.start + trimmed.delta;
+    }
+  }
   // If the snippet accidentally includes a prefix before an inline heading marker, drop that prefix.
   const inlineHeading = snippet.search(/#{1,6}\s+\S+/);
-  if (inlineHeading > 0) snippet = snippet.slice(inlineHeading);
+  if (inlineHeading > 0) {
+    snippet = snippet.slice(inlineHeading);
+    mapped.start = mapped.start + inlineHeading;
+  }
   if (!snippet.trim()) return null;
 
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
@@ -1144,7 +1198,15 @@ function refineRangeByQuestionMatch(
   const tightEnd = startIdx + tight.endIdx;
 
   const mapped = mapNormRangeToOrig(map, tightStart, tightEnd, chunkContent.length);
-  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  let snippet = chunkContent.slice(mapped.start, mapped.end);
+  {
+    const mainToken = tokens.find((t) => t.length >= 2) || tokens[0];
+    const trimmed = trimLeadingToBoldHeading(snippet, mainToken);
+    if (trimmed.delta > 0) {
+      snippet = trimmed.snippet;
+      mapped.start = mapped.start + trimmed.delta;
+    }
+  }
   if (!snippet.trim()) return null;
 
   return {
