@@ -191,7 +191,11 @@ function refineRangeByDefinitionTopic(
     return any >= 0 ? any : idx;
   })();
 
-  const { startIdx, endIdx } = getSentenceBounds(text, matchIdx, { maxLen: 220 });
+  // IMPORTANT: don't include headings/preamble that often appear before "X是..." in Markdown.
+  // Always start at the actual match position (or later) to avoid highlighting unrelated content above.
+  const bounds = getSentenceBounds(text, matchIdx, { maxLen: 220 });
+  const startIdx = Math.max(bounds.startIdx, matchIdx);
+  const endIdx = bounds.endIdx;
   const snippet = text.slice(startIdx, endIdx);
   if (!snippet.trim()) return null;
 
@@ -310,6 +314,27 @@ function extractMatchTokensFromQuestion(question: string): string[] {
     "llm",
     "LLM",
     "模型",
+    // File/meta words
+    "txt",
+    "md",
+    "pdf",
+    "docx",
+    "doc",
+    "文件",
+    "文档",
+    "笔记",
+    "内容",
+    "这里",
+    "里面",
+    "提到",
+    "说",
+    "讲",
+    "说明",
+    "介绍",
+    "问题",
+    "答案",
+    "引用",
+    "溯源",
   ]);
 
   const tokens = new Set<string>();
@@ -320,6 +345,28 @@ function extractMatchTokensFromQuestion(question: string): string[] {
   }
   // Prefer longer tokens first (e.g. "国歌" > "什么")
   return Array.from(tokens).sort((a, b) => b.length - a.length).slice(0, 12);
+}
+
+function filterTokensByRarityInText(text: string, tokens: string[]): string[] {
+  // Drop tokens that occur too frequently in the chunk; they are weak anchors for highlighting.
+  const kept: Array<{ t: string; freq: number }> = [];
+  for (const t of tokens) {
+    let from = 0;
+    let freq = 0;
+    while (from < text.length && freq <= 12) {
+      const idx = text.indexOf(t, from);
+      if (idx < 0) break;
+      freq++;
+      from = idx + Math.max(1, Math.floor(t.length / 2));
+    }
+    // Keep if reasonably rare, or if the token is long enough to be specific.
+    if (freq <= 6 || t.length >= 4) kept.push({ t, freq });
+  }
+  // Prefer longer and rarer tokens.
+  return kept
+    .sort((a, b) => b.t.length - a.t.length || a.freq - b.freq)
+    .map((x) => x.t)
+    .slice(0, 10);
 }
 
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
@@ -521,6 +568,103 @@ function getSentenceBounds(
   return { startIdx: start, endIdx: end };
 }
 
+function refineRangeBySentenceMatch(
+  chunkContent: string,
+  chunkStartAbs: number,
+  question: string,
+  maxLen = 220
+): { content: string; startChar: number; endChar: number } | null {
+  const text = chunkContent.replace(/\r\n/g, "\n");
+  const tokens0 = extractMatchTokensFromQuestion(question);
+  const tokens = filterTokensByRarityInText(text, tokens0);
+  if (tokens.length === 0) return null;
+  const matchIdx = findBestKeywordMatchIndex(text, tokens);
+  if (matchIdx === null) return null;
+
+  const { startIdx, endIdx } = getSentenceBounds(text, matchIdx, { maxLen });
+  const snippet = text.slice(startIdx, endIdx);
+  if (!snippet.trim()) return null;
+
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + startIdx,
+    endChar: chunkStartAbs + endIdx,
+  };
+}
+
+function refineRangeByMarkdownLineMatch(
+  chunkContent: string,
+  chunkStartAbs: number,
+  question: string,
+  maxLen = 180
+): { content: string; startChar: number; endChar: number } | null {
+  const text = chunkContent.replace(/\r\n/g, "\n");
+  const tokens0 = extractMatchTokensFromQuestion(question);
+  const tokens = filterTokensByRarityInText(text, tokens0);
+  if (tokens.length === 0) return null;
+  const matchIdx = findBestKeywordMatchIndex(text, tokens);
+  if (matchIdx === null) return null;
+
+  const isMdHeading = (s: string) => /^\s*#{1,6}\s+\S+/.test(s.trim());
+  const looksLikeQuestionLine = (s: string) => /[?？]/.test(s) || /(怎么|如何|为什么|是什么|有哪些|是否|区别)/.test(s);
+
+  // Line boundaries for match
+  const prevNl = text.lastIndexOf("\n", matchIdx);
+  const nextNl = text.indexOf("\n", matchIdx);
+  let startIdx = prevNl >= 0 ? prevNl + 1 : 0;
+  let endIdx = nextNl >= 0 ? nextNl : text.length;
+
+  // Handle cases like "...。## Title" where the heading got glued to the previous sentence.
+  // If we see an inline heading marker, cut the line to start from that heading.
+  {
+    const rawLine = text.slice(startIdx, endIdx);
+    const inlineHeadingPos = rawLine.search(/#{1,6}\s+\S+/);
+    if (inlineHeadingPos > 0) {
+      startIdx = startIdx + inlineHeadingPos;
+    }
+  }
+
+  let line = text.slice(startIdx, endIdx).trim();
+
+  // If we matched a heading/question line, highlight the next non-empty non-heading line as the "answer" line.
+  if (isMdHeading(line) || looksLikeQuestionLine(line)) {
+    let cursor = endIdx;
+    for (let hops = 0; hops < 4 && cursor < text.length; hops++) {
+      // move to start of next line
+      cursor = cursor + 1;
+      if (cursor >= text.length) break;
+      const nextEnd = text.indexOf("\n", cursor);
+      const nextLineEnd = nextEnd >= 0 ? nextEnd : text.length;
+      const nextLineRaw = text.slice(cursor, nextLineEnd);
+      const nextLine = nextLineRaw.trim();
+      if (!nextLine) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      if (isMdHeading(nextLine)) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      startIdx = cursor;
+      endIdx = nextLineEnd;
+      line = nextLine;
+      break;
+    }
+  }
+
+  // Cap highlight size hard.
+  if (endIdx - startIdx > maxLen) endIdx = startIdx + maxLen;
+
+  // Trim
+  while (startIdx < endIdx && (text[startIdx] === " " || text[startIdx] === "\n")) startIdx++;
+  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+
+  const snippet = text.slice(startIdx, endIdx);
+  if (!snippet.trim()) return null;
+
+  return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
+}
+
 function getAllQuestionHeaderPositions(text: string): number[] {
   const headers: number[] = [];
   const patterns: RegExp[] = [
@@ -577,7 +721,8 @@ function refineRangeByQuestionMatch(
   question: string
 ): { content: string; startChar: number; endChar: number } | null {
   const text = chunkContent.replace(/\r\n/g, "\n");
-  const tokens = extractMatchTokensFromQuestion(question);
+  const tokens0 = extractMatchTokensFromQuestion(question);
+  const tokens = filterTokensByRarityInText(text, tokens0);
   if (tokens.length === 0) return null;
 
   const matchIdx = findBestKeywordMatchIndex(text, tokens);
@@ -962,6 +1107,9 @@ export async function POST(req: NextRequest) {
     const uiSources: SourceChunk[] = focusedSources.map((s) => {
       if (!Number.isFinite(s.startChar)) return s;
 
+      const lowerName = (s.filename || "").toLowerCase();
+      const isMarkdown = lowerName.endsWith(".md") || lowerName.endsWith(".markdown");
+
       if (defTopic) {
         const refined = refineRangeByDefinitionTopic(s.content, s.startChar, defTopic);
         if (refined) {
@@ -971,6 +1119,24 @@ export async function POST(req: NextRequest) {
 
       if (qNum) {
         const refined = refineRangeByNumber(s.content, s.startChar, qNum);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
+      // For markdown notes, always prefer sentence-level highlighting to avoid
+      // highlighting adjacent unrelated lines/paragraphs.
+      if (isMarkdown) {
+        const lineRefined = refineRangeByMarkdownLineMatch(s.content, s.startChar, retrievalQuestion, 180);
+        if (lineRefined) {
+          return {
+            ...s,
+            content: lineRefined.content,
+            startChar: lineRefined.startChar,
+            endChar: lineRefined.endChar,
+          };
+        }
+        const refined = refineRangeBySentenceMatch(s.content, s.startChar, retrievalQuestion, 220);
         if (refined) {
           return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
         }
