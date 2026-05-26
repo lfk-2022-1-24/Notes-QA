@@ -1,7 +1,6 @@
 import matter from "gray-matter";
 import iconv from "iconv-lite";
 import mammoth from "mammoth";
-import WordExtractor from "word-extractor";
 
 type PDFParseInstance = {
   getText: () => Promise<{ text: string }>;
@@ -49,10 +48,8 @@ export async function parseFile(
       return parsePdf(buffer);
     case "docx":
       return parseDocx(buffer);
-    case "doc":
-      return parseDoc(buffer);
     default:
-      throw new Error(`Unsupported file format: .${ext}. Supported: .md, .txt, .pdf, .docx, .doc`);
+      throw new Error(`Unsupported file format: .${ext}. Supported: .md, .txt, .pdf, .docx`);
   }
 }
 
@@ -82,14 +79,6 @@ async function parseDocx(buffer: Buffer): Promise<ParseResult> {
   const result = await mammoth.extractRawText({ buffer });
   const text = (result.value || "").replace(/\r\n/g, "\n");
   return { text, fileType: "docx" };
-}
-
-async function parseDoc(buffer: Buffer): Promise<ParseResult> {
-  // word-extractor supports extracting from Buffer without external binaries
-  const extractor = new WordExtractor();
-  const doc = await extractor.extract(buffer);
-  const text = (doc.getBody?.() || "").replace(/\r\n/g, "\n");
-  return { text, fileType: "doc" };
 }
 
 function decodeTextBuffer(buffer: Buffer): string {

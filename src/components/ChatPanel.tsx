@@ -48,10 +48,20 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   const buildAnchorText = (sourceContent: string): string => {
-    // Use a mid-slice to reduce collisions on generic headings/preambles.
     if (!sourceContent) return "";
     const text = sourceContent.trim();
     if (text.length <= 260) return text;
+
+    // If the snippet starts with a numbered Q/A header or a markdown heading,
+    // keep the beginning since it is the most unique anchor.
+    const head = text.slice(0, 80);
+    const looksLikeHeader =
+      /^\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/.test(head) ||
+      /^\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)/.test(head) ||
+      /^\s*#{1,6}\s+\S+/.test(head);
+    if (looksLikeHeader) return text.slice(0, 260);
+
+    // Otherwise use a mid-slice to reduce collisions on common preambles.
     const mid = Math.floor(text.length / 2);
     const start = Math.max(0, mid - 130);
     return text.slice(start, start + 260);

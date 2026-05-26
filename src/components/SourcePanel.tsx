@@ -192,7 +192,12 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
           const verifyText = content.slice(verifyStart, verifyEnd);
           const okByTokens = tokens.length === 0 ? true : countTokenHits(verifyText, tokens) >= 1;
 
-          if (uniqueInWindow && okByTokens) {
+          // Hard guard: never allow anchor-based alignment to move far away from backend offsets.
+          // This prevents drifting upwards into repeated "template" sections in txt notes.
+          const closeToProvided =
+            !isRangeValid || Math.abs(absIdx - startChar) <= 600;
+
+          if (uniqueInWindow && okByTokens && closeToProvided) {
             // Only adjust the start position; preserve the intended highlight length
             // from backend to avoid over-highlighting for docx/doc paragraphs.
             const len = Number.isFinite(endChar) && Number.isFinite(startChar) ? Math.max(40, endChar - startChar) : anchor.length;

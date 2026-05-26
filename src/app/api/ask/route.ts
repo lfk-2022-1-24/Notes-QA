@@ -97,6 +97,21 @@ function stripPunctuation(s: string): string {
   return s.replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "");
 }
 
+function normalizeForLooseSearch(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "");
+}
+
+function isNearDuplicateQuestion(chunkContent: string, question: string): boolean {
+  const q = normalizeForLooseSearch(question);
+  if (!q || q.length < 4) return false;
+  const c = normalizeForLooseSearch(chunkContent);
+  // If the chunk contains the question (or a very close prefix), treat it as an exact/near-exact match.
+  return c.includes(q) || (q.length >= 8 && c.includes(q.slice(0, 8)));
+}
+
 function normalizeLooseContains(s: string): string {
   return (s || "")
     .replace(/\s+/g, "")
@@ -109,6 +124,45 @@ function includesLoose(haystack: string, needle: string): boolean {
   if (!n) return false;
   const h = normalizeLooseContains(haystack);
   return h.includes(n);
+}
+
+function buildLfTextAndMap(orig: string): { text: string; map: number[] } {
+  // Normalize CRLF -> LF for matching/regex, while keeping a mapping to original indices.
+  // map[normIndex] = origIndex
+  const map: number[] = [];
+  let out = "";
+  for (let i = 0; i < orig.length; i++) {
+    const ch = orig[i]!;
+    if (ch === "\r" && orig[i + 1] === "\n") continue;
+    out += ch;
+    map[out.length - 1] = i;
+  }
+  return { text: out, map };
+}
+
+function mapNormRangeToOrig(map: number[], startNorm: number, endNorm: number, origLen: number) {
+  const s = Math.max(0, Math.min(startNorm, map.length));
+  const e = Math.max(s, Math.min(endNorm, map.length));
+  if (map.length === 0) return { start: 0, end: 0 };
+
+  const start = s >= map.length ? origLen : map[s] ?? 0;
+  const end =
+    e <= 0
+      ? 0
+      : e >= map.length
+        ? origLen
+        : ((map[e - 1] ?? map[map.length - 1] ?? 0) + 1);
+
+  return { start: Math.max(0, start), end: Math.max(Math.max(0, start), end) };
+}
+
+function anyTokenMatchLoose(content: string, tokens: string[]): boolean {
+  if (!tokens || tokens.length === 0) return false;
+  for (const t of tokens) {
+    if (!t) continue;
+    if (includesLoose(content, t)) return true;
+  }
+  return false;
 }
 
 type QuestionFocus = {
@@ -159,7 +213,7 @@ function refineRangeByDefinitionTopic(
   chunkStartAbs: number,
   topic: string
 ): { content: string; startChar: number; endChar: number } | null {
-  const text = chunkContent.replace(/\r\n/g, "\n");
+  const { text, map } = buildLfTextAndMap(chunkContent);
   const t = topic.trim();
   if (!t || t.length < 2) return null;
 
@@ -196,10 +250,11 @@ function refineRangeByDefinitionTopic(
   const bounds = getSentenceBounds(text, matchIdx, { maxLen: 220 });
   const startIdx = Math.max(bounds.startIdx, matchIdx);
   const endIdx = bounds.endIdx;
-  const snippet = text.slice(startIdx, endIdx);
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
-  return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
 }
 
 function extractQuestionNumber(question: string): number | null {
@@ -219,7 +274,7 @@ function refineRangeByNumber(
   chunkStartAbs: number,
   n: number
 ): { content: string; startChar: number; endChar: number } | null {
-  const text = chunkContent.replace(/\r\n/g, "\n");
+  const { text, map } = buildLfTextAndMap(chunkContent);
 
   const startPatterns: RegExp[] = [
     new RegExp(`(^|\\n)\\s*(?:Q\\s*)?${n}\\s*[:：.．、)）]`, "m"),
@@ -278,13 +333,14 @@ function refineRangeByNumber(
   while (localEnd > localStart && /\s/.test(text[localEnd - 1]!)) localEnd--;
   while (localStart < localEnd && text[localStart] === "\n") localStart++;
 
-  const snippet = text.slice(localStart, localEnd);
+  const mapped = mapNormRangeToOrig(map, localStart, localEnd, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
   return {
     content: snippet,
-    startChar: chunkStartAbs + localStart,
-    endChar: chunkStartAbs + localEnd,
+    startChar: chunkStartAbs + mapped.start,
+    endChar: chunkStartAbs + mapped.end,
   };
 }
 
@@ -574,7 +630,7 @@ function refineRangeBySentenceMatch(
   question: string,
   maxLen = 220
 ): { content: string; startChar: number; endChar: number } | null {
-  const text = chunkContent.replace(/\r\n/g, "\n");
+  const { text, map } = buildLfTextAndMap(chunkContent);
   const tokens0 = extractMatchTokensFromQuestion(question);
   const tokens = filterTokensByRarityInText(text, tokens0);
   if (tokens.length === 0) return null;
@@ -582,13 +638,14 @@ function refineRangeBySentenceMatch(
   if (matchIdx === null) return null;
 
   const { startIdx, endIdx } = getSentenceBounds(text, matchIdx, { maxLen });
-  const snippet = text.slice(startIdx, endIdx);
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
   return {
     content: snippet,
-    startChar: chunkStartAbs + startIdx,
-    endChar: chunkStartAbs + endIdx,
+    startChar: chunkStartAbs + mapped.start,
+    endChar: chunkStartAbs + mapped.end,
   };
 }
 
@@ -598,7 +655,7 @@ function refineRangeByMarkdownLineMatch(
   question: string,
   maxLen = 180
 ): { content: string; startChar: number; endChar: number } | null {
-  const text = chunkContent.replace(/\r\n/g, "\n");
+  const { text, map } = buildLfTextAndMap(chunkContent);
   const tokens0 = extractMatchTokensFromQuestion(question);
   const tokens = filterTokensByRarityInText(text, tokens0);
   if (tokens.length === 0) return null;
@@ -659,10 +716,11 @@ function refineRangeByMarkdownLineMatch(
   while (startIdx < endIdx && (text[startIdx] === " " || text[startIdx] === "\n")) startIdx++;
   while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
 
-  const snippet = text.slice(startIdx, endIdx);
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
-  return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
 }
 
 function getAllQuestionHeaderPositions(text: string): number[] {
@@ -720,7 +778,7 @@ function refineRangeByQuestionMatch(
   chunkStartAbs: number,
   question: string
 ): { content: string; startChar: number; endChar: number } | null {
-  const text = chunkContent.replace(/\r\n/g, "\n");
+  const { text, map } = buildLfTextAndMap(chunkContent);
   const tokens0 = extractMatchTokensFromQuestion(question);
   const tokens = filterTokensByRarityInText(text, tokens0);
   if (tokens.length === 0) return null;
@@ -730,16 +788,18 @@ function refineRangeByQuestionMatch(
 
   // Try to bound by nearest question header before the match, and next header after it.
   const headers = getAllLikelyQuestionHeaderPositions(text);
-  if (headers.length < 2) {
+  if (headers.length < 1) {
     // Not a numbered Q/A style chunk; tighten around match.
     // If we only have 1 token (often very generic, like "诚信"), prefer sentence-level to avoid huge highlights.
     const { startIdx, endIdx } =
       tokens.length <= 1 ? getSentenceBounds(text, matchIdx, { maxLen: 320 }) : getTightBounds(text, matchIdx);
-    const snippet = text.slice(startIdx, endIdx);
+    const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+    const snippet = chunkContent.slice(mapped.start, mapped.end);
     if (!snippet.trim()) return null;
-    return { content: snippet, startChar: chunkStartAbs + startIdx, endChar: chunkStartAbs + endIdx };
+    return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
   }
-  let startIdx = 0;
+  // Even if there is only ONE header in this chunk, use it as a hard start boundary.
+  let startIdx = headers[0] ?? 0;
   for (const h of headers) {
     if (h <= matchIdx) startIdx = h;
     else break;
@@ -771,13 +831,14 @@ function refineRangeByQuestionMatch(
   const tightStart = startIdx + tight.startIdx;
   const tightEnd = startIdx + tight.endIdx;
 
-  const snippet = text.slice(tightStart, tightEnd);
+  const mapped = mapNormRangeToOrig(map, tightStart, tightEnd, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
   return {
     content: snippet,
-    startChar: chunkStartAbs + tightStart,
-    endChar: chunkStartAbs + tightEnd,
+    startChar: chunkStartAbs + mapped.start,
+    endChar: chunkStartAbs + mapped.end,
   };
 }
 
@@ -1064,8 +1125,21 @@ export async function POST(req: NextRequest) {
       .sort((a, b) => scoreExact(b.content) - scoreExact(a.content) || b.similarity - a.similarity)
       .slice(0, TOP_K);
 
+    // Post-filter: keep only chunks that contain at least one strong query token.
+    // This reduces "answer is correct but citations drift to unrelated blocks" (common for txt notes).
+    const qTokens = extractMatchTokensFromQuestion(retrievalQuestion);
+    const strongTokens = (defTopic ? [defTopic, ...qTokens] : qTokens)
+      .filter(Boolean)
+      .filter((t) => t.length >= 3)
+      .slice(0, 8);
+    const fallbackTokens = (defTopic ? [defTopic, ...qTokens] : qTokens).filter(Boolean).slice(0, 8);
+    const filterTokens = strongTokens.length > 0 ? strongTokens : fallbackTokens;
+
+    const filteredRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
+    const finalRelevantChunks = filteredRelevant.length >= Math.min(LLM_TOP_K, 3) ? filteredRelevant : relevantChunks;
+
     // Build base sources (full chunk content) for the LLM.
-    const baseSources: SourceChunk[] = relevantChunks.map((row, index) => {
+    const baseSources: SourceChunk[] = finalRelevantChunks.map((row, index) => {
       const chunkStart =
         typeof row.start_char === "number" ? row.start_char : Number.parseInt(row.start_char, 10);
       const chunkEnd = typeof row.end_char === "number" ? row.end_char : Number.parseInt(row.end_char, 10);
@@ -1085,6 +1159,13 @@ export async function POST(req: NextRequest) {
     // - If focus.topic exists, keep only those mentioning the topic.
     // - If the question is a definition ("X是什么"), prefer sources that mention X to avoid unrelated chunks.
     const focusedSources = (() => {
+      // If the note contains the user's question as an almost-exact string (common in Q/A txt),
+      // aggressively prefer that chunk to avoid citing adjacent template/metadata blocks.
+      const nearExact = baseSources.filter((s) => isNearDuplicateQuestion(s.content, retrievalQuestion));
+      if (nearExact.length > 0) {
+        return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
+      }
+
       if (focus.topic) {
         const arr = baseSources.filter((s) => includesLoose(s.content, focus.topic!));
         return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
