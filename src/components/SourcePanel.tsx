@@ -153,10 +153,14 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   };
 
   const renderHighlightedContent = (content: string) => {
+    // Normalize CRLF -> LF so backend offsets (which are typically computed on LF text)
+    // align with what we render/highlight in the UI.
+    const doc = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
     // Only highlight inside the cited note. Prevents unrelated highlights
     // when user expands other notes while a highlight is still active.
     if (!highlight || highlight.noteId !== noteDetail?.note.id) {
-      return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
+      return <pre className="whitespace-pre-wrap text-sm">{doc}</pre>;
     }
 
     let { startChar, endChar } = highlight;
@@ -166,19 +170,30 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
       Number.isFinite(endChar) &&
       startChar >= 0 &&
       endChar > startChar &&
-      endChar <= content.length;
+      endChar <= doc.length;
+
+    const isDateQuery = /\b20\d{2}-\d{2}-\d{2}\b/.test(highlight.queryText || "");
+    const anchorLooksLikeLogHeading = (() => {
+      const a = (highlight.anchorText || "").trim();
+      return /^#\s*日志\s*20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b/.test(a) || /^#\s*日志\s*20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(a);
+    })();
 
     // Stronger anchor alignment:
     // - only search for anchor within a window around the provided offsets (or start of doc as fallback)
     // - require the matched location to contain at least one query token (prevents unrelated matches)
+    //
+    // IMPORTANT: for date-scoped log queries, trust backend offsets to avoid "drift" across repeated templates.
     if (highlight.anchorText) {
-      const anchor = highlight.anchorText.trim().slice(0, 260);
+      if (isDateQuery || anchorLooksLikeLogHeading) {
+        // Skip anchor-based realignment for log/date queries.
+      } else {
+      const anchor = highlight.anchorText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().slice(0, 260);
       if (anchor.length >= 24) {
         const tokens = extractQueryTokens(highlight.queryText || "");
         const center = isRangeValid ? Math.floor((startChar + endChar) / 2) : 0;
         const winStart = Math.max(0, center - 3000);
-        const winEnd = Math.min(content.length, center + 3000);
-        const windowText = content.slice(winStart, winEnd);
+        const winEnd = Math.min(doc.length, center + 3000);
+        const windowText = doc.slice(winStart, winEnd);
 
         const localIdx = windowText.indexOf(anchor);
         if (localIdx >= 0) {
@@ -188,8 +203,8 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
 
           // Verify token hits around match.
           const verifyStart = Math.max(0, absIdx - 200);
-          const verifyEnd = Math.min(content.length, absIdx + anchor.length + 600);
-          const verifyText = content.slice(verifyStart, verifyEnd);
+          const verifyEnd = Math.min(doc.length, absIdx + anchor.length + 600);
+          const verifyText = doc.slice(verifyStart, verifyEnd);
           const okByTokens = tokens.length === 0 ? true : countTokenHits(verifyText, tokens) >= 1;
 
           // Hard guard: never allow anchor-based alignment to move far away from backend offsets.
@@ -202,21 +217,22 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
             // from backend to avoid over-highlighting for docx/doc paragraphs.
             const len = Number.isFinite(endChar) && Number.isFinite(startChar) ? Math.max(40, endChar - startChar) : anchor.length;
             startChar = absIdx;
-            endChar = Math.min(content.length, absIdx + Math.min(anchor.length, len));
+            endChar = Math.min(doc.length, absIdx + Math.min(anchor.length, len));
           }
         }
+      }
       }
     }
 
     if (!Number.isFinite(startChar) || startChar < 0) startChar = 0;
-    if (!Number.isFinite(endChar) || endChar <= startChar) endChar = Math.min(content.length, startChar + 200);
+    if (!Number.isFinite(endChar) || endChar <= startChar) endChar = Math.min(doc.length, startChar + 200);
     // Final UI safeguard: never highlight an overly large span.
     if (endChar - startChar > 220) endChar = startChar + 220;
-    if (startChar >= content.length) return <pre className="whitespace-pre-wrap text-sm">{content}</pre>;
+    if (startChar >= doc.length) return <pre className="whitespace-pre-wrap text-sm">{doc}</pre>;
 
-    const before = content.slice(0, startChar);
-    const highlighted = content.slice(startChar, endChar);
-    const after = content.slice(endChar);
+    const before = doc.slice(0, startChar);
+    const highlighted = doc.slice(startChar, endChar);
+    const after = doc.slice(endChar);
 
     return (
       <pre className="whitespace-pre-wrap text-sm">

@@ -198,6 +198,139 @@ function buildTopicLikePatterns(topic: string): string[] {
   return Array.from(patterns).slice(0, 3);
 }
 
+function extractDateYYYYMMDD(s: string): string | null {
+  // Normalize common date forms into canonical YYYY-MM-DD.
+  const raw = String(s || "");
+  const m1 = raw.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
+  const m2 = raw.match(/\b(20\d{2})[\/.](\d{1,2})[\/.](\d{1,2})\b/);
+  const m3 = raw.match(/\b(20\d{2})年(\d{1,2})月(\d{1,2})[日号]\b/);
+  const m4 = raw.match(/\b(20\d{2})(\d{2})(\d{2})\b/); // 20240216
+  if (m4) return `${m4[1]}-${m4[2]}-${m4[3]}`;
+  const m = m1 ?? m2 ?? m3;
+  if (!m) return null;
+  const y = m[1]!;
+  const mm = String(Number.parseInt(m[2]!, 10)).padStart(2, "0");
+  const dd = String(Number.parseInt(m[3]!, 10)).padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
+}
+
+function buildDateVariants(dateYYYYMMDD: string): string[] {
+  // Expand a canonical YYYY-MM-DD into common log/note formats.
+  const m = dateYYYYMMDD.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return [];
+  const y = m[1]!;
+  const mm = m[2]!;
+  const dd = m[3]!;
+  const m1 = String(Number.parseInt(mm, 10));
+  const d1 = String(Number.parseInt(dd, 10));
+  const set = new Set<string>();
+  set.add(`${y}-${mm}-${dd}`);
+  set.add(`${y}-${m1}-${d1}`);
+  set.add(`${y}/${mm}/${dd}`);
+  set.add(`${y}/${m1}/${d1}`);
+  set.add(`${y}.${mm}.${dd}`);
+  set.add(`${y}.${m1}.${d1}`);
+  set.add(`${y}年${mm}月${dd}日`);
+  set.add(`${y}年${m1}月${d1}日`);
+  set.add(`${y}年${mm}月${dd}号`);
+  set.add(`${y}年${m1}月${d1}号`);
+  set.add(`${y}${mm}${dd}`);
+  // Yearless variants (some logs omit year in body but keep it in filename/context).
+  set.add(`${mm}-${dd}`);
+  set.add(`${m1}-${d1}`);
+  set.add(`${mm}/${dd}`);
+  set.add(`${m1}/${d1}`);
+  set.add(`${mm}.${dd}`);
+  set.add(`${m1}.${d1}`);
+  set.add(`${mm}月${dd}日`);
+  set.add(`${m1}月${d1}日`);
+  set.add(`${mm}月${dd}号`);
+  set.add(`${m1}月${d1}号`);
+  return Array.from(set);
+}
+
+function normalizeDateMatchText(s: string): string {
+  let out = String(s || "").replace(/\s+/g, "");
+  out = out.replace(/[‐‑‒–—−]/g, "-");
+  out = out.replace(/[／]/g, "/");
+  out = out.replace(/[．]/g, ".");
+  out = out.replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xff10 + 0x30));
+  out = out.replace(/[\u200b\u200c\u200d\ufeff]/g, "");
+  return out;
+}
+
+function includesDateLoose(text: string, dateVariant: string): boolean {
+  const t = normalizeDateMatchText(text);
+  const d = normalizeDateMatchText(dateVariant);
+  if (!d) return false;
+  return t.includes(d);
+}
+
+function pickYearfulDateVariants(dateHint: string, variants: string[]): string[] {
+  const year = dateHint.slice(0, 4);
+  const yearful = variants.filter((v) => v.includes(year) || v.startsWith(year));
+  return yearful.length > 0 ? yearful : variants;
+}
+
+function refineRangeByLogDateHeading(
+  chunkContent: string,
+  chunkStartAbs: number,
+  dateHint: string,
+  dateVariants: string[],
+  maxLen = 1400
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  const variants = pickYearfulDateVariants(dateHint, dateVariants.length > 0 ? dateVariants : [dateHint]);
+
+  type Heading = { pos: number; level: number; title: string };
+  const headings: Heading[] = [];
+  const re = /(^|\n)(#{1,6})\s+([^\n]+)/g;
+  for (const m of text.matchAll(re)) {
+    if (m.index === undefined) continue;
+    const prefix = m[1] ?? "";
+    const pos = m.index + prefix.length;
+    const level = (m[2] || "#").length;
+    const title = (m[3] || "").trim();
+    headings.push({ pos, level, title });
+  }
+  if (headings.length === 0) return null;
+
+  const isDateHeading = (h: Heading) =>
+    /日志/.test(h.title) &&
+    (/\b20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b/.test(h.title) || /\b20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(h.title));
+
+  // Find the first heading that contains the requested date.
+  let chosen: Heading | null = null;
+  for (const h of headings) {
+    if (variants.some((v) => includesDateLoose(h.title, v))) {
+      chosen = h;
+      break;
+    }
+  }
+  if (!chosen) return null;
+
+  let startIdx = chosen.pos;
+  let endIdx = Math.min(text.length, startIdx + maxLen);
+
+  for (const h of headings) {
+    if (h.pos <= chosen.pos) continue;
+    if (h.level <= chosen.level && isDateHeading(h)) {
+      endIdx = Math.min(endIdx, h.pos);
+      break;
+    }
+  }
+
+  // Trim whitespace
+  while (startIdx < endIdx && (text[startIdx] === " " || text[startIdx] === "\n")) startIdx++;
+  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  if (!snippet.trim()) return null;
+
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+}
+
 function trimLeadingToBoldHeading(
   snippet: string,
   preferredToken?: string
@@ -1398,6 +1531,10 @@ export async function POST(req: NextRequest) {
 
     // Rewrite for retrieval so pronouns like "it/its/他的/它的" become standalone.
     const retrievalQuestion = await rewriteStandaloneQuestion(question, safeHistory);
+    // Date hint should be extracted from the original question first.
+    // The rewrite step can occasionally drop the explicit date (e.g. "总结这天"), which would break date-scoped queries.
+    const dateHint = extractDateYYYYMMDD(question) ?? extractDateYYYYMMDD(retrievalQuestion);
+    const dateVariants = dateHint ? buildDateVariants(dateHint) : [];
     const focus = extractFocus(retrievalQuestion);
     const defTopic = extractDefinitionTopic(retrievalQuestion);
     const inclusionTopic = extractInclusionTopic(retrievalQuestion);
@@ -1415,7 +1552,9 @@ export async function POST(req: NextRequest) {
       console.warn("Embedding failed, falling back to keyword-only retrieval:", e instanceof Error ? e.message : e);
       vectorStr = null;
     }
-    const rawQ = retrievalQuestion.trim();
+    // For date-scoped log queries, prefer the ORIGINAL question for keyword recall and ranking.
+    const keywordQuestion = (dateHint ? question : retrievalQuestion).trim();
+    const rawQ = keywordQuestion;
     const qNoPunct = stripPunctuation(rawQ);
 
     let vectorRows: SearchRow[] = [];
@@ -1515,7 +1654,7 @@ export async function POST(req: NextRequest) {
       similarity: parseFloat(r.similarity),
     }));
 
-    const patterns = buildKeywordPatterns(retrievalQuestion);
+    const patterns = buildKeywordPatterns(keywordQuestion);
     if (patterns.length > 0) {
       const focusLikes =
         topicHint && focus.aspectWord
@@ -1523,9 +1662,13 @@ export async function POST(req: NextRequest) {
           : topicHint
             ? buildTopicLikePatterns(topicHint)
             : [];
-      const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...focusLikes, ...patterns];
+      const dateLikes = dateHint ? pickYearfulDateVariants(dateHint, dateVariants).map((d) => `%${d}%`).slice(0, 10) : [];
+      const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...dateLikes, ...focusLikes, ...patterns];
       const whereOffset = vectorStr ? 3 : 2; // $1 is vector (when present), $1 is LIMIT otherwise
-      const where = all.map((_, i) => `c.content ILIKE $${i + whereOffset}`).join(" OR ");
+      // Match both chunk content and filename, so date-only filenames still work for log queries.
+      const where = all
+        .map((_, i) => `(c.content ILIKE $${i + whereOffset} OR n.filename ILIKE $${i + whereOffset})`)
+        .join(" OR ");
 
       // Exact-hit score + keyword-hit count; then fall back to vector distance.
       const exactHit =
@@ -1575,10 +1718,39 @@ export async function POST(req: NextRequest) {
       }));
     }
 
+    // Date-only fallback: if user asks about a specific date, directly recall chunks by that date (content OR filename).
+    // This avoids missing results when the query contains broad tokens like “总结/这天”.
+    let dateRows: SearchRow[] = [];
+    if (dateHint) {
+      const likes = dateVariants.length > 0 ? pickYearfulDateVariants(dateHint, dateVariants).slice(0, 10).map((d) => `%${d}%`) : [`%${dateHint}%`];
+      const where = likes.map((_, i) => `(c.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+      const dateResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE ${where}
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, ...likes]
+      );
+      dateRows = dateResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
+
     // Merge exact match + keyword match
     const mergedKw = new Map<string, SearchRow>();
     for (const r of exactRows) mergedKw.set(r.id, r);
     for (const r of keywordRows) mergedKw.set(r.id, r);
+    for (const r of dateRows) mergedKw.set(r.id, r);
     keywordRows = Array.from(mergedKw.values());
 
     // Merge: prefer keyword hits first (higher recall), then fill with vector hits.
@@ -1669,6 +1841,15 @@ export async function POST(req: NextRequest) {
         return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
       }
 
+      // Date-scoped log summary: keep only sources that contain the exact date heading to avoid extra/mismatched citations.
+      if (dateHint) {
+        const arr = baseSources.filter((s) => {
+          const refined = refineRangeByLogDateHeading(s.content, 0, dateHint, dateVariants, 200);
+          return Boolean(refined && includesDateLoose(refined.content, dateHint));
+        });
+        return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
+      }
+
       if (topicHint) {
         const arr = baseSources.filter((s) => includesTopicLoose(s.content, topicHint));
         return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
@@ -1719,6 +1900,13 @@ export async function POST(req: NextRequest) {
 
       const lowerName = (s.filename || "").toLowerCase();
       const isMarkdown = lowerName.endsWith(".md") || lowerName.endsWith(".markdown");
+
+      if (dateHint) {
+        const refined = refineRangeByLogDateHeading(s.content, s.startChar, dateHint, dateVariants, 1500);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
 
       if (defTopic) {
         const refined = refineRangeByDefinitionTopic(s.content, s.startChar, defTopic);
@@ -1781,6 +1969,11 @@ export async function POST(req: NextRequest) {
             const refined = refineRangeByDefinitionTopic(s.content, 0, defTopic);
             return refined ? { ...s, content: refined.content } : s;
           })
+        : dateHint
+          ? focusedSources.map((s) => {
+              const refined = refineRangeByLogDateHeading(s.content, 0, dateHint, dateVariants, 1800);
+              return refined ? { ...s, content: refined.content } : s;
+            })
         : focusedSources;
 
     // Ask LLM with sources
