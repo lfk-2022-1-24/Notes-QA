@@ -151,6 +151,53 @@ function includesLoose(haystack: string, needle: string): boolean {
   return h.includes(n);
 }
 
+function includesTopicLoose(haystack: string, topic: string): boolean {
+  // Like includesLoose, but tolerant to common Chinese connector "的" inserted between words.
+  // Example: topic "集体利益" should match "集体的利益".
+  if (includesLoose(haystack, topic)) return true;
+  const t = topic.trim();
+  if (!t || t.length < 3) return false;
+  const h0 = normalizeLooseContains(haystack);
+  const t0 = normalizeLooseContains(t);
+  if (!h0 || !t0) return false;
+  // Remove "的" only for the topic match (avoid global behavior changes elsewhere).
+  const h = h0.replace(/的/g, "");
+  const n = t0.replace(/的/g, "");
+  if (!n) return false;
+  return h.includes(n);
+}
+
+function topicTokenVariants(topic: string): string[] {
+  const t = (topic || "").trim();
+  if (!t) return [];
+  const out: string[] = [t];
+  // For common 4+ char Chinese topics, add head/tail to match forms like "集体的利益".
+  if (/^[\p{Script=Han}]{4,}$/u.test(t)) {
+    out.push(t.slice(0, 2));
+    out.push(t.slice(-2));
+    if (t.length >= 6) {
+      out.push(t.slice(0, 3));
+      out.push(t.slice(-3));
+    }
+  }
+  // Dedup + cap
+  return Array.from(new Set(out)).slice(0, 5);
+}
+
+function buildTopicLikePatterns(topic: string): string[] {
+  const t = (topic || "").trim();
+  if (!t) return [];
+  const patterns = new Set<string>();
+  patterns.add(`%${t}%`);
+  // Allow connector words like "的" between parts, e.g. "%集体%利益%" matches "集体的利益".
+  if (/^[\p{Script=Han}]{4,}$/u.test(t)) {
+    const head2 = t.slice(0, 2);
+    const tail2 = t.slice(-2);
+    if (head2 && tail2) patterns.add(`%${head2}%${tail2}%`);
+  }
+  return Array.from(patterns).slice(0, 3);
+}
+
 function trimLeadingToBoldHeading(
   snippet: string,
   preferredToken?: string
@@ -383,6 +430,24 @@ function extractDefinitionTopic(question: string): string | null {
   return null;
 }
 
+function extractInclusionTopic(question: string): string | null {
+  const q = question.trim();
+  if (!q) return null;
+  // Chinese: "X包括哪些" / "X包含什么" / "X主要包括什么" / "X具体包括哪些呀"
+  const m1 = q.match(/^(.+?)\s*(?:主要|具体|一般|通常|常见|常用)?\s*(?:包括|包含)\s*(?:哪些|什么|什么内容|有哪些|哪几类|哪几种|哪方面|都有哪些)\s*[?？呀啊呢吗]*$/);
+  if (m1) {
+    const topic = (m1[1] || "").trim();
+    return topic.length >= 2 ? topic : null;
+  }
+  // Variant: "X都包括什么" / "X包括什么"
+  const m2 = q.match(/^(.+?)\s*(?:都)?\s*(?:包括|包含)\s*(?:什么|哪些)\s*[?？呀啊呢吗]*$/);
+  if (m2) {
+    const topic = (m2[1] || "").trim();
+    return topic.length >= 2 ? topic : null;
+  }
+  return null;
+}
+
 function hasDefinitionCue(content: string, topic: string): boolean {
   const c = normalizeLooseContains(content);
   const t = normalizeLooseContains(topic);
@@ -466,6 +531,50 @@ function refineRangeByDefinitionTopic(
   const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
 
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+}
+
+function refineRangeByInclusionTopic(
+  chunkContent: string,
+  chunkStartAbs: number,
+  topic: string,
+  maxLen = 260
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  const t = topic.trim();
+  if (!t || t.length < 2) return null;
+
+  const idxTopic = text.indexOf(t);
+  if (idxTopic < 0) return null;
+
+  // Prefer the first occurrence of "包括/包含/主要包括" after the topic.
+  const cues = ["主要包括", "具体包括", "一般包括", "通常包括", "包括", "包含"];
+  let idx = idxTopic;
+  for (const c of cues) {
+    const i = text.indexOf(c, idxTopic);
+    if (i >= 0 && i - idxTopic <= 260) {
+      idx = i;
+      break;
+    }
+  }
+
+  const bounds = getSentenceBounds(text, idx, { maxLen });
+  const startIdx = Math.max(idxTopic, bounds.startIdx);
+  let endIdx = bounds.endIdx;
+
+  // Cut before next Q/A header if present (PDF Q/A flattening).
+  {
+    const lookAhead = text.slice(startIdx, Math.min(text.length, startIdx + 900));
+    const nextHeader = lookAhead.match(/(^|[^\d])\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]\s+|(^|[^\S\r\n])(?:问题|问)\s*[:：]/m);
+    if (nextHeader && nextHeader.index !== undefined) {
+      const rel = nextHeader.index + ((nextHeader[1] ?? nextHeader[2])?.length ?? 0);
+      if (rel >= 18) endIdx = Math.min(endIdx, startIdx + rel);
+    }
+  }
+
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  if (!snippet.trim()) return null;
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
 }
 
@@ -583,6 +692,15 @@ function extractMatchTokensFromQuestion(question: string): string[] {
     "要",
     "的",
     "吗",
+    // Inclusion phrasing (too generic for anchoring/highlighting)
+    "包括",
+    "包含",
+    "主要包括",
+    "具体包括",
+    "都包括",
+    "有哪些",
+    "哪几类",
+    "哪几种",
     // Very generic tokens that often appear everywhere; they skew "earliest match" to the document start.
     "agent",
     "Agent",
@@ -1136,6 +1254,15 @@ function getAllLikelyQuestionHeaderPositions(text: string): number[] {
     }
   }
 
+  // PDF / extracted Q&A style: "问题：... 答案：..."
+  // Treat "问题：" as a hard header even if the line doesn't contain '?'.
+  for (const m of text.matchAll(/(^|[^\S\r\n])(?:问题|问)\s*[:：]/gm)) {
+    if (m.index === undefined) continue;
+    const prefix = m[1] ?? "";
+    const idx = m.index + prefix.length;
+    headers.push(idx);
+  }
+
   return headers.sort((a, b) => a - b);
 }
 
@@ -1273,6 +1400,8 @@ export async function POST(req: NextRequest) {
     const retrievalQuestion = await rewriteStandaloneQuestion(question, safeHistory);
     const focus = extractFocus(retrievalQuestion);
     const defTopic = extractDefinitionTopic(retrievalQuestion);
+    const inclusionTopic = extractInclusionTopic(retrievalQuestion);
+    const topicHint = focus.topic ?? defTopic ?? inclusionTopic ?? undefined;
     const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
 
     // Embed the question
@@ -1321,9 +1450,9 @@ export async function POST(req: NextRequest) {
     if (vectorStr && vectorRelevant.length < MIN_KEEP) vectorRelevant = vectorRows.slice(0, MIN_KEEP);
 
     // If we have a clear topic, prefer candidates that mention it.
-    if (focus.topic) {
-      const topic = focus.topic;
-      const focusedVector = vectorRows.filter((row) => row.content.includes(topic));
+    if (topicHint) {
+      const topic = topicHint;
+      const focusedVector = vectorRows.filter((row) => includesTopicLoose(row.content, topic));
       if (focusedVector.length > 0) {
         vectorRelevant = focusedVector.slice(0, TOP_K);
       }
@@ -1333,12 +1462,8 @@ export async function POST(req: NextRequest) {
     // If the question contains distinctive tokens (e.g. “审核结果”“准确性”), search those tokens directly
     // and then rank those keyword-matched chunks by vector distance.
     let keywordRows: SearchRow[] = [];
-    const exactLikes = [
-      `%${rawQ}%`,
-      `%${qNoPunct}%`,
-      `%Q4:%${qNoPunct}%`,
-      `%Q：%${qNoPunct}%`,
-    ];
+    // Keep this fixed-length (4) to match the hard-coded placeholders in the exact-match queries below.
+    const exactLikes = [`%${rawQ}%`, `%${qNoPunct}%`, `%Q4:%${qNoPunct}%`, `%Q：%${qNoPunct}%`];
 
     // Exact phrase match is the most reliable for Q/A style notes.
     const exactResult = vectorStr
@@ -1393,7 +1518,11 @@ export async function POST(req: NextRequest) {
     const patterns = buildKeywordPatterns(retrievalQuestion);
     if (patterns.length > 0) {
       const focusLikes =
-        focus.topic && focus.aspectWord ? [`%${focus.topic}%`, `%${focus.aspectWord}%`] : focus.topic ? [`%${focus.topic}%`] : [];
+        topicHint && focus.aspectWord
+          ? [...buildTopicLikePatterns(topicHint), `%${focus.aspectWord}%`]
+          : topicHint
+            ? buildTopicLikePatterns(topicHint)
+            : [];
       const all = [`%${rawQ}%`, `%${qNoPunct}%`, ...focusLikes, ...patterns];
       const whereOffset = vectorStr ? 3 : 2; // $1 is vector (when present), $1 is LIMIT otherwise
       const where = all.map((_, i) => `c.content ILIKE $${i + whereOffset}`).join(" OR ");
@@ -1460,7 +1589,7 @@ export async function POST(req: NextRequest) {
     const scoreExact = (content: string) => {
       const c = content;
       let s = 0;
-      if (focus.topic && includesLoose(c, focus.topic)) s += 6;
+      if (topicHint && includesTopicLoose(c, topicHint)) s += 6;
       if (focus.aspectWord && includesLoose(c, focus.aspectWord)) s += 3;
       if (defTopic && includesLoose(c, defTopic)) s += 4;
       if (defTopic && includesLoose(c, `${defTopic}是`)) s += 6;
@@ -1479,7 +1608,12 @@ export async function POST(req: NextRequest) {
     // Post-filter: keep only chunks that contain at least one strong query token.
     // This reduces "answer is correct but citations drift to unrelated blocks" (common for txt notes).
     const qTokens = extractMatchTokensFromQuestion(retrievalQuestion);
-    const focusTokens = [focus.topic, focus.aspectWord].filter((x): x is string => Boolean(x)).slice(0, 2);
+    const focusTokens = Array.from(
+      new Set<string>([
+        ...(topicHint ? topicTokenVariants(topicHint).slice(0, 2) : []),
+        ...(focus.aspectWord ? [focus.aspectWord] : []),
+      ])
+    ).slice(0, 3);
 
     const strongTokens = (defTopic ? [defTopic, ...qTokens] : qTokens)
       .filter(Boolean)
@@ -1495,7 +1629,7 @@ export async function POST(req: NextRequest) {
 
     // For longer questions, require 2+ token hits to avoid "vaguely related" chunks.
     const minHits =
-      (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) && !defTopic && !focus.topic ? 2 : 1;
+      (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) && !defTopic && !topicHint ? 2 : 1;
 
     const filteredRelevant = relevantChunks.filter((r) => countTokenMatchesLoose(r.content, filterTokens) >= minHits);
     const relaxedRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
@@ -1535,8 +1669,8 @@ export async function POST(req: NextRequest) {
         return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
       }
 
-      if (focus.topic) {
-        const arr = baseSources.filter((s) => includesLoose(s.content, focus.topic!));
+      if (topicHint) {
+        const arr = baseSources.filter((s) => includesTopicLoose(s.content, topicHint));
         return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
       }
 
@@ -1562,6 +1696,23 @@ export async function POST(req: NextRequest) {
         .slice(0, LLM_TOP_K);
     })();
 
+    // Guardrail: if the user asks about a clear topic ("X是什么"/"X包括什么"/focus patterns),
+    // but we failed to retrieve any chunk mentioning that topic, don't answer with unrelated citations.
+    if (topicHint && !focusedSources.some((s) => includesTopicLoose(s.content, topicHint))) {
+      // Let the downstream no-answer flow produce the two-stage clarification UX.
+      const isClarifyMarker = (s: string) => s.includes("【需要补充上下文】");
+      const lastTurn = safeHistory.at(-1);
+      const askedClarifyLastTurn = Boolean(lastTurn?.answer && isClarifyMarker(lastTurn.answer));
+      const stage1 = `【需要补充上下文】\n我在当前笔记里暂时没检索到能直接回答你这个问题的内容。你可以补充一下：\n（1）你说的关键术语/对象具体指什么？（可以给全称、同义词、英文缩写）\n或者\n（2）如果你手头有相关段落/关键词，请直接贴出来或上传对应资料。`;
+      const stage2 = `我在当前已上传的笔记中仍然没有检索到与该问题直接相关、可用于作答的资料。\n如果你希望我继续回答，请上传/补充相关笔记（或把关键段落贴出来），我再基于新增资料进行检索与问答。`;
+      return NextResponse.json({
+        answer: askedClarifyLastTurn ? stage2 : stage1,
+        sources: [],
+        hasAnswer: askedClarifyLastTurn ? false : true,
+        rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+      });
+    }
+
     // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
     const uiSources: SourceChunk[] = focusedSources.map((s) => {
       if (!Number.isFinite(s.startChar)) return s;
@@ -1571,6 +1722,12 @@ export async function POST(req: NextRequest) {
 
       if (defTopic) {
         const refined = refineRangeByDefinitionTopic(s.content, s.startChar, defTopic);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+      if (inclusionTopic) {
+        const refined = refineRangeByInclusionTopic(s.content, s.startChar, inclusionTopic, 320);
         if (refined) {
           return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
         }
@@ -1628,7 +1785,7 @@ export async function POST(req: NextRequest) {
 
     // Ask LLM with sources
     const result = await askQuestion(question, llmSources, {
-      focusTopic: focus.topic ?? defTopic ?? undefined,
+      focusTopic: topicHint,
       focusAspect: focus.aspectWord,
     });
 

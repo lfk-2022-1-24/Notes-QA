@@ -48,7 +48,9 @@ Rules:
 5. Do NOT make up information that is not in the sources.
 6. Do NOT use external knowledge to supplement the answer.
 7. If the sources contain suggested phrasing, example replies, or a recommended way to respond, include that wording.
-8. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
+8. Respond in the same language as the user's question (Chinese question -> Simplified Chinese answer; English question -> English answer).
+9. For definition-style questions ("X是什么/什么是X"), if the sources don't provide a single-sentence definition but do provide what X includes/consists of, answer in the form "在你的笔记中，X主要包括：..." and cite sources.
+10. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
 
 const REWRITE_SYSTEM_PROMPT = `You rewrite a user's question into a standalone question using chat history.
 
