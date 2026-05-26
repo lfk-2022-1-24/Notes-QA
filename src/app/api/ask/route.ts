@@ -260,12 +260,20 @@ function refineRangeByNumberedQaQuestionText(
     // Guard: avoid matching ordered list items that are not Q/A.
     // Accept if:
     // - explicit 问/答 markers exist, OR
-    // - question mark + answer marker exist, OR
+    // - question mark + answer marker exist (or the answer is in parentheses right after '?'), OR
     // - the header line is an "aspect/diff" style item (优缺点/区别/是什么...) and matches 2+ query tokens.
     const hasQaMarkers = qMark >= 0 || aMark >= 0;
     const hasQuestionMark = /[?？]/.test(qText);
+    const qmInBlock = block.search(/[?？]/);
+    const hasParenAnswerNearQ =
+      qmInBlock >= 0 && /[（(]/.test(block.slice(qmInBlock + 1, Math.min(block.length, qmInBlock + 12)));
     const looksLikeAspectItem = /(优点|缺点|优缺点|区别|对比|不同|是什么|定义|含义|原理|机制|作用|意义)/.test(qText);
-    if (!hasQaMarkers && !(hasQuestionMark && aMark >= 0) && !(looksLikeAspectItem && hit >= 2)) continue;
+    if (
+      !hasQaMarkers &&
+      !(hasQuestionMark && (aMark >= 0 || hasParenAnswerNearQ) && hit >= 1) &&
+      !(looksLikeAspectItem && hit >= 2)
+    )
+      continue;
 
     const qTextNorm = normalizeForLooseSearch(qText);
     let score = 0;
