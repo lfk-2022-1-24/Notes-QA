@@ -155,7 +155,8 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
   const renderHighlightedContent = (content: string) => {
     // Normalize CRLF -> LF so backend offsets (which are typically computed on LF text)
     // align with what we render/highlight in the UI.
-    const doc = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const raw = content || "";
+    const doc = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
     // Only highlight inside the cited note. Prevents unrelated highlights
     // when user expands other notes while a highlight is still active.
@@ -165,6 +166,21 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
 
     let { startChar, endChar } = highlight;
 
+    // Map backend offsets (raw string indices) to UI indices (LF-normalized).
+    // Only CRLF removes one char, so we subtract the number of "\r\n" pairs before the offset.
+    const rawToDocIndex = (idxRaw: number) => {
+      if (!Number.isFinite(idxRaw) || idxRaw <= 0) return 0;
+      const max = Math.min(raw.length, Math.floor(idxRaw));
+      let removed = 0;
+      for (let i = 0; i < max - 1; i++) {
+        if (raw[i] === "\r" && raw[i + 1] === "\n") removed++;
+      }
+      return Math.max(0, idxRaw - removed);
+    };
+
+    startChar = rawToDocIndex(startChar);
+    endChar = rawToDocIndex(endChar);
+
     const isRangeValid =
       Number.isFinite(startChar) &&
       Number.isFinite(endChar) &&
@@ -172,10 +188,16 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
       endChar > startChar &&
       endChar <= doc.length;
 
-    const isDateQuery = /\b20\d{2}-\d{2}-\d{2}\b/.test(highlight.queryText || "");
+    const isDateQuery =
+      /\b20\d{2}-\d{2}-\d{2}\b/.test(highlight.queryText || "") ||
+      /\b20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(highlight.queryText || "") ||
+      /\b20\d{6}\b/.test(highlight.queryText || "");
     const anchorLooksLikeLogHeading = (() => {
       const a = (highlight.anchorText || "").trim();
-      return /^#\s*日志\s*20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b/.test(a) || /^#\s*日志\s*20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(a);
+      return (
+        /^#?\s*日志\s*20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b/.test(a) ||
+        /^#?\s*日志\s*20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(a)
+      );
     })();
 
     // Stronger anchor alignment:

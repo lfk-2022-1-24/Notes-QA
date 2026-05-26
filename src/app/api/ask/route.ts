@@ -266,6 +266,40 @@ function includesDateLoose(text: string, dateVariant: string): boolean {
   return t.includes(d);
 }
 
+function computeDisplaySimilarity(args: {
+  existing: number;
+  content: string;
+  filename: string;
+  filterTokens: string[];
+  topicHint?: string;
+  dateHint?: string;
+  dateVariants?: string[];
+}): number {
+  const { existing, content, filename, filterTokens, topicHint, dateHint, dateVariants } = args;
+  if (Number.isFinite(existing) && existing > 0) return Math.min(1, existing);
+
+  // Date queries: prefer a high score when the exact date is present.
+  if (dateHint) {
+    const vars = dateVariants && dateVariants.length > 0 ? dateVariants : [dateHint];
+    const inContent = vars.some((v) => includesDateLoose(content, v));
+    const inName = vars.some((v) => includesDateLoose(filename, v));
+    const base = inContent ? 0.98 : inName ? 0.85 : 0.35;
+    return base;
+  }
+
+  // Token-based heuristic for keyword-only retrieval.
+  const denom = Math.max(3, Math.min(8, filterTokens.length || 0));
+  const hits = filterTokens.length > 0 ? countTokenMatchesLoose(content, filterTokens) : 0;
+  let score = denom > 0 ? hits / denom : 0;
+
+  if (topicHint && includesTopicLoose(content, topicHint)) score = Math.max(score, 0.65);
+  if (includesLoose(content, filename)) score = Math.max(score, 0.25);
+
+  // Clamp to a reasonable UI range (avoid 0.0% for real matches).
+  score = Math.max(0.12, Math.min(0.95, score));
+  return score;
+}
+
 function pickYearfulDateVariants(dateHint: string, variants: string[]): string[] {
   const year = dateHint.slice(0, 4);
   const yearful = variants.filter((v) => v.includes(year) || v.startsWith(year));
@@ -329,6 +363,85 @@ function refineRangeByLogDateHeading(
   if (!snippet.trim()) return null;
 
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+}
+
+function refineRangeByPlainLogDateHeading(
+  chunkContent: string,
+  chunkStartAbs: number,
+  dateHint: string,
+  dateVariants: string[],
+  maxLen = 1400
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  const variants = pickYearfulDateVariants(dateHint, dateVariants.length > 0 ? dateVariants : [dateHint]);
+
+  // Prefer "日志 <date>" anchors (common in txt exports).
+  let matchIdx = -1;
+  for (const v of variants) {
+    const re = new RegExp(`(?:^|\\n)\\s*日志\\s*${escapeRegExp(v)}\\b`, "m");
+    const m = text.match(re);
+    if (m && m.index !== undefined) {
+      matchIdx = m.index + (m[0].startsWith("\n") ? 1 : 0);
+      break;
+    }
+  }
+  if (matchIdx < 0) {
+    // Fallback: find the date, then scan a short prefix for "日志".
+    for (const v of variants) {
+      const i = text.indexOf(v);
+      if (i < 0) continue;
+      const prefixStart = Math.max(0, i - 24);
+      const prefix = text.slice(prefixStart, i);
+      if (prefix.includes("日志")) {
+        // move to line start
+        const prevNl = text.lastIndexOf("\n", i);
+        matchIdx = prevNl >= 0 ? prevNl + 1 : Math.max(0, prefixStart);
+        break;
+      }
+    }
+  }
+  if (matchIdx < 0) return null;
+
+  // Start at the line start containing "日志 ..."
+  const startIdx = matchIdx;
+
+  // End at next "日志 <YYYY-MM-DD>" style header, or at a strong separator line.
+  let endIdx = Math.min(text.length, startIdx + maxLen);
+  const lookAhead = text.slice(startIdx + 1, Math.min(text.length, startIdx + 6000));
+
+  const nextLog = lookAhead.search(/(?:^|\n)\s*日志\s*20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b|(?:^|\n)\s*日志\s*20\d{2}年\d{1,2}月\d{1,2}[日号]\b/m);
+  if (nextLog >= 0 && nextLog >= 20) endIdx = Math.min(endIdx, startIdx + 1 + nextLog);
+
+  const nextSep = lookAhead.search(/(?:^|\n)\s*[─-]{8,}\s*(?:\n|$)/m);
+  if (nextSep >= 0 && nextSep >= 40) endIdx = Math.min(endIdx, startIdx + 1 + nextSep);
+
+  // Trim
+  let s = startIdx;
+  let e = endIdx;
+  while (s < e && (text[s] === " " || text[s] === "\n")) s++;
+  while (e > s && /\s/.test(text[e - 1]!)) e--;
+
+  const mapped = mapNormRangeToOrig(map, s, e, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  if (!snippet.trim()) return null;
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+}
+
+function escapeRegExp(s: string): string {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function refineRangeByAnyLogDateHeading(
+  chunkContent: string,
+  chunkStartAbs: number,
+  dateHint: string,
+  dateVariants: string[],
+  maxLen = 1400
+): { content: string; startChar: number; endChar: number } | null {
+  return (
+    refineRangeByLogDateHeading(chunkContent, chunkStartAbs, dateHint, dateVariants, maxLen) ??
+    refineRangeByPlainLogDateHeading(chunkContent, chunkStartAbs, dateHint, dateVariants, maxLen)
+  );
 }
 
 function trimLeadingToBoldHeading(
@@ -1826,7 +1939,15 @@ export async function POST(req: NextRequest) {
         content: row.content,
         startChar: chunkStart,
         endChar: chunkEnd,
-        similarity: row.similarity,
+        similarity: computeDisplaySimilarity({
+          existing: row.similarity,
+          content: row.content,
+          filename: row.filename,
+          filterTokens,
+          topicHint,
+          dateHint: dateHint ?? undefined,
+          dateVariants,
+        }),
       };
     });
 
@@ -1844,7 +1965,7 @@ export async function POST(req: NextRequest) {
       // Date-scoped log summary: keep only sources that contain the exact date heading to avoid extra/mismatched citations.
       if (dateHint) {
         const arr = baseSources.filter((s) => {
-          const refined = refineRangeByLogDateHeading(s.content, 0, dateHint, dateVariants, 200);
+          const refined = refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 200);
           return Boolean(refined && includesDateLoose(refined.content, dateHint));
         });
         return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
@@ -1902,7 +2023,7 @@ export async function POST(req: NextRequest) {
       const isMarkdown = lowerName.endsWith(".md") || lowerName.endsWith(".markdown");
 
       if (dateHint) {
-        const refined = refineRangeByLogDateHeading(s.content, s.startChar, dateHint, dateVariants, 1500);
+        const refined = refineRangeByAnyLogDateHeading(s.content, s.startChar, dateHint, dateVariants, 1500);
         if (refined) {
           return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
         }
@@ -1971,7 +2092,7 @@ export async function POST(req: NextRequest) {
           })
         : dateHint
           ? focusedSources.map((s) => {
-              const refined = refineRangeByLogDateHeading(s.content, 0, dateHint, dateVariants, 1800);
+              const refined = refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 1800);
               return refined ? { ...s, content: refined.content } : s;
             })
         : focusedSources;
