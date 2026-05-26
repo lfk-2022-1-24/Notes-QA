@@ -14,6 +14,31 @@ const GAP_THRESHOLD = 0.12;
 const KEYWORD_K = 60;
 const LLM_TOP_K = 8;
 
+function normalizeAnswerCitationsToAvailableSources(answer: string, sources: SourceChunk[]): string {
+  if (!answer || sources.length === 0) return answer;
+  const available = new Set<number>(sources.map((s) => s.index).filter((n) => Number.isFinite(n)));
+  if (available.size === 0) return answer;
+  const sorted = Array.from(available).sort((a, b) => a - b);
+  const maxIdx = sorted[sorted.length - 1]!;
+
+  // If the model emits a citation number that we didn't return (e.g. [3] while we only have [1]),
+  // remap it to the closest available index so the UI can still show a source.
+  return answer.replace(/\[(\d+)\]/g, (full, g1) => {
+    const n = Number.parseInt(String(g1), 10);
+    if (!Number.isFinite(n)) return full;
+    if (available.has(n)) return full;
+    // clamp to closest: below 1 -> first, above max -> last, otherwise nearest lower.
+    if (n <= sorted[0]!) return `[${sorted[0]}]`;
+    if (n >= maxIdx) return `[${maxIdx}]`;
+    let lower = sorted[0]!;
+    for (const v of sorted) {
+      if (v <= n) lower = v;
+      else break;
+    }
+    return `[${lower}]`;
+  });
+}
+
 type SearchRow = {
   id: string;
   note_id: string;
@@ -165,6 +190,96 @@ function anyTokenMatchLoose(content: string, tokens: string[]): boolean {
   return false;
 }
 
+function countTokenMatchesLoose(content: string, tokens: string[]): number {
+  if (!tokens || tokens.length === 0) return 0;
+  let hits = 0;
+  for (const t of tokens) {
+    if (!t) continue;
+    if (includesLoose(content, t)) hits++;
+  }
+  return hits;
+}
+
+function refineRangeByNumberedQaQuestionText(
+  chunkContent: string,
+  chunkStartAbs: number,
+  question: string,
+  maxLen = 520
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  const qNorm = normalizeForLooseSearch(question);
+  if (!qNorm || qNorm.length < 4) return null;
+
+  // Typical extraction format (pdf/txt/docx flattening): "33. 问：...？ 答：..."
+  // NOTE: Many parsers flatten line breaks into spaces, so we cannot rely on '\n'.
+  // Use a non-digit boundary instead to find headers in the middle of a long line.
+  const headerRe = /(^|[^\d])(\d{1,4})\s*[.．、)]\s*问\s*[:：]/gm;
+  const headers: { idx: number; num: number }[] = [];
+  for (const m of text.matchAll(headerRe)) {
+    const prefix = m[1] ?? "";
+    const idx = (m.index ?? 0) + prefix.length;
+    const num = Number.parseInt(m[2] ?? "", 10);
+    if (!Number.isFinite(num)) continue;
+    headers.push({ idx, num });
+  }
+  if (headers.length === 0) return null;
+
+  const tokens0 = extractMatchTokensFromQuestion(question);
+  const tokens = filterTokensByRarityInText(text, tokens0);
+
+  let best: { startIdx: number; endIdx: number; score: number } | null = null;
+
+  for (let i = 0; i < headers.length; i++) {
+    const startIdx = headers[i]!.idx;
+    const endIdx = i + 1 < headers.length ? headers[i + 1]!.idx : Math.min(text.length, startIdx + 1200);
+    if (endIdx <= startIdx + 10) continue;
+
+    const block = text.slice(startIdx, endIdx);
+    const qMark = block.search(/问\s*[:：]/);
+    if (qMark < 0) continue;
+    const aMark = block.search(/答\s*[:：]/);
+    const qTextRaw =
+      aMark > qMark ? block.slice(qMark + 2, aMark) : block.slice(qMark + 2, Math.min(block.length, qMark + 180));
+    const qText = qTextRaw.replace(/\s+/g, " ").trim();
+    if (qText.length < 6) continue;
+
+    const qTextNorm = normalizeForLooseSearch(qText);
+    let score = 0;
+
+    // Big bonus for near-duplicate question lines.
+    if (qTextNorm && (qNorm.includes(qTextNorm) || qTextNorm.includes(qNorm))) score += 12;
+
+    // Token overlap within the question line (not the whole answer) is a strong signal.
+    const hit = countTokenMatchesLoose(qText, tokens.length > 0 ? tokens : tokens0);
+    score += hit * 3;
+
+    // Prefer blocks whose question line ends with a question mark.
+    if (/[?？]\s*$/.test(qText)) score += 1;
+
+    if (!best || score > best.score) {
+      best = { startIdx, endIdx, score };
+    }
+  }
+
+  if (!best || best.score < 4) return null;
+
+  let startIdx = best.startIdx;
+  let endIdx = best.endIdx;
+
+  // Clip to a readable window but never cross into the next question.
+  if (endIdx - startIdx > maxLen) endIdx = startIdx + maxLen;
+
+  // Trim whitespace
+  while (startIdx < endIdx && (text[startIdx] === "\n" || text[startIdx] === " ")) startIdx++;
+  while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
+
+  const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  if (!snippet.trim()) return null;
+
+  return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+}
+
 type QuestionFocus = {
   topic?: string;
   aspect?: "advantages" | "disadvantages";
@@ -231,6 +346,10 @@ function refineRangeByDefinitionTopic(
     const i = text.indexOf(c);
     if (i >= 0 && (idx < 0 || i < idx)) idx = i;
   }
+  // Fallback: many notes mention the term but don't have "X是什么" titles.
+  if (idx < 0) {
+    idx = text.indexOf(t);
+  }
   if (idx < 0) return null;
 
   // For definition-style queries, prefer a sentence-level highlight around "X是/指/意味着"
@@ -248,7 +367,8 @@ function refineRangeByDefinitionTopic(
   // IMPORTANT: don't include headings/preamble that often appear before "X是..." in Markdown.
   // Always start at the actual match position (or later) to avoid highlighting unrelated content above.
   const bounds = getSentenceBounds(text, matchIdx, { maxLen: 220 });
-  const startIdx = Math.max(bounds.startIdx, matchIdx);
+  // For "definition topic", never include content before the topic occurrence itself.
+  const startIdx = Math.max(matchIdx, bounds.startIdx);
   const endIdx = bounds.endIdx;
   const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
   const snippet = chunkContent.slice(mapped.start, mapped.end);
@@ -355,6 +475,13 @@ function extractMatchTokensFromQuestion(question: string): string[] {
     "为什么",
     "怎么",
     "如何",
+    "讲解",
+    "解释",
+    "说明",
+    "介绍",
+    "概述",
+    "分析",
+    "总结",
     "是不是",
     "是否",
     "听到",
@@ -393,11 +520,79 @@ function extractMatchTokensFromQuestion(question: string): string[] {
     "溯源",
   ]);
 
+  const stripSuffixParticles = (s: string) => {
+    let out = s.trim();
+    // Common Chinese particles/prepositions that often attach to nouns in questions.
+    out = out.replace(/(上的|里的|中的|内的|外的)$/g, "");
+    out = out.replace(/(上|下|中|内|外)$/g, "");
+    out = out.replace(/的$/g, "");
+    return out;
+  };
+
+  const stripInterrogativePrefixes = (s: string) => {
+    let out = s.trim();
+    // Common leading question phrases in Chinese.
+    out = out.replace(/^(怎么才能|如何才能|怎么|如何|怎样|为什么|什么|哪些|是否|能否|可以|应该|要不要|如何去|怎么去)/g, "");
+    out = out.replace(/^才能/g, "");
+    out = out.replace(/^是/g, "");
+    out = out.trim();
+    return out;
+  };
+
   const tokens = new Set<string>();
   for (const m of q.matchAll(/[\p{Script=Han}A-Za-z0-9]{2,}/gu)) {
     const t = m[0].trim();
     if (!t || stop.has(t)) continue;
-    tokens.add(t);
+    const base = stripInterrogativePrefixes(stripSuffixParticles(t));
+    if (base && !stop.has(base)) tokens.add(base);
+
+    // Heuristics for Chinese: add tail/head substrings to avoid missing matches when
+    // the query contains leading verbs like “讲解/解释/介绍...”.
+    // Example: “讲解垃圾回收” -> add “垃圾回收”.
+    const verbPrefixes = ["讲解", "解释", "说明", "介绍", "概述", "分析", "总结", "聊聊", "说说", "讲讲"];
+    for (const vp of verbPrefixes) {
+      if (base.startsWith(vp) && base.length > vp.length + 1) {
+        const tail = stripInterrogativePrefixes(stripSuffixParticles(base.slice(vp.length)));
+        if (tail && !stop.has(tail)) tokens.add(tail);
+      }
+    }
+
+    // Split by common particle "的" to extract topic words.
+    for (const part of base.split("的").filter(Boolean)) {
+      const p = stripInterrogativePrefixes(stripSuffixParticles(part));
+      if (p.length >= 2 && !stop.has(p)) tokens.add(p);
+    }
+
+    if (base.length >= 4) {
+      const tail4 = stripInterrogativePrefixes(stripSuffixParticles(base.slice(-4)));
+      if (tail4.length >= 2 && !stop.has(tail4)) tokens.add(tail4);
+    }
+    if (base.length >= 6) {
+      const tail3 = stripInterrogativePrefixes(stripSuffixParticles(base.slice(-3)));
+      if (tail3.length >= 2 && !stop.has(tail3)) tokens.add(tail3);
+    }
+  }
+  // Add a couple of canonical tokens for "辨别真伪/正确错误" style questions.
+  const qLower = q.toLowerCase();
+  if (qLower.includes("分辨") || qLower.includes("辨别") || qLower.includes("判断")) {
+    tokens.add("分辨");
+    tokens.add("辨别");
+    tokens.add("判断");
+  }
+  if (qLower.includes("正确") || qLower.includes("错误") || qLower.includes("是非") || qLower.includes("真伪")) {
+    tokens.add("正确");
+    tokens.add("错误");
+    tokens.add("是非");
+    tokens.add("真伪");
+  }
+  if (qLower.includes("网络") || qLower.includes("网上") || qLower.includes("互联网")) {
+    tokens.add("网络");
+    tokens.add("网上");
+    tokens.add("互联网");
+  }
+  if (qLower.includes("观点") || qLower.includes("说法")) {
+    tokens.add("观点");
+    tokens.add("说法");
   }
   // Prefer longer tokens first (e.g. "国歌" > "什么")
   return Array.from(tokens).sort((a, b) => b.length - a.length).slice(0, 12);
@@ -423,6 +618,12 @@ function filterTokensByRarityInText(text: string, tokens: string[]): string[] {
     .sort((a, b) => b.t.length - a.t.length || a.freq - b.freq)
     .map((x) => x.t)
     .slice(0, 10);
+}
+
+function isOverviewQuestion(question: string): boolean {
+  const q = question.trim();
+  if (!q) return false;
+  return /(讲解|解释|说明|介绍|概述|分析|总结|聊聊|说说|讲讲)\b/.test(q);
 }
 
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
@@ -664,6 +865,79 @@ function refineRangeByMarkdownLineMatch(
 
   const isMdHeading = (s: string) => /^\s*#{1,6}\s+\S+/.test(s.trim());
   const looksLikeQuestionLine = (s: string) => /[?？]/.test(s) || /(怎么|如何|为什么|是什么|有哪些|是否|区别)/.test(s);
+  const isMdNoiseLine = (s: string) => {
+    const t = s.trim();
+    return t.startsWith("![") || /^\s*!\[.*\]\(.*\)\s*$/.test(t) || /^[-*_]{3,}\s*$/.test(t);
+  };
+
+  const overview = isOverviewQuestion(question);
+  const mainToken = tokens.find((t) => t.length >= 2) || tokens[0];
+
+  // Overview mode: if we can find a heading containing the main token near the match,
+  // return a section slice (not just a single line).
+  if (overview && mainToken) {
+    type Heading = { pos: number; level: number; title: string };
+    const headings: Heading[] = [];
+    const re = /(^|\n)(#{1,6})\s+([^\n]+)/g;
+    for (const m of text.matchAll(re)) {
+      if (m.index === undefined) continue;
+      const prefix = m[1] ?? "";
+      const pos = m.index + prefix.length;
+      const level = (m[2] || "#").length;
+      const title = (m[3] || "").trim();
+      headings.push({ pos, level, title });
+    }
+
+    if (headings.length > 0) {
+      // Choose the last heading before match that mentions the main token.
+      let chosen: Heading | null = null;
+      for (const h of headings) {
+        if (h.pos > matchIdx) break;
+        if (includesLoose(h.title, mainToken)) chosen = h;
+      }
+
+      // Fallback: choose the last heading before match.
+      if (!chosen) {
+        for (const h of headings) {
+          if (h.pos > matchIdx) break;
+          chosen = h;
+        }
+      }
+
+      if (chosen) {
+        // Start after heading line, then skip empty/noise lines.
+        const headingLineEnd = text.indexOf("\n", chosen.pos);
+        let startIdx = headingLineEnd >= 0 ? headingLineEnd + 1 : chosen.pos;
+        for (let hops = 0; hops < 6 && startIdx < text.length; hops++) {
+          const nextEnd = text.indexOf("\n", startIdx);
+          const lineEnd = nextEnd >= 0 ? nextEnd : text.length;
+          const line = text.slice(startIdx, lineEnd).trim();
+          if (!line || isMdNoiseLine(line)) {
+            startIdx = lineEnd + 1;
+            continue;
+          }
+          break;
+        }
+
+        // End at next heading of same or higher level, or cap by maxLen.
+        let endIdx = Math.min(text.length, startIdx + Math.max(400, maxLen));
+        for (const h of headings) {
+          if (h.pos <= chosen.pos) continue;
+          if (h.level <= chosen.level) {
+            endIdx = Math.min(endIdx, h.pos);
+            break;
+          }
+        }
+
+        if (endIdx - startIdx > maxLen) endIdx = startIdx + maxLen;
+        const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+        const snippet = chunkContent.slice(mapped.start, mapped.end);
+        if (snippet.trim()) {
+          return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
+        }
+      }
+    }
+  }
 
   // Line boundaries for match
   const prevNl = text.lastIndexOf("\n", matchIdx);
@@ -686,7 +960,7 @@ function refineRangeByMarkdownLineMatch(
   // If we matched a heading/question line, highlight the next non-empty non-heading line as the "answer" line.
   if (isMdHeading(line) || looksLikeQuestionLine(line)) {
     let cursor = endIdx;
-    for (let hops = 0; hops < 4 && cursor < text.length; hops++) {
+    for (let hops = 0; hops < 6 && cursor < text.length; hops++) {
       // move to start of next line
       cursor = cursor + 1;
       if (cursor >= text.length) break;
@@ -699,6 +973,10 @@ function refineRangeByMarkdownLineMatch(
         continue;
       }
       if (isMdHeading(nextLine)) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      if (isMdNoiseLine(nextLine)) {
         cursor = nextLineEnd;
         continue;
       }
@@ -717,7 +995,10 @@ function refineRangeByMarkdownLineMatch(
   while (endIdx > startIdx && /\s/.test(text[endIdx - 1]!)) endIdx--;
 
   const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
-  const snippet = chunkContent.slice(mapped.start, mapped.end);
+  let snippet = chunkContent.slice(mapped.start, mapped.end);
+  // If the snippet accidentally includes a prefix before an inline heading marker, drop that prefix.
+  const inlineHeading = snippet.search(/#{1,6}\s+\S+/);
+  if (inlineHeading > 0) snippet = snippet.slice(inlineHeading);
   if (!snippet.trim()) return null;
 
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
@@ -751,9 +1032,10 @@ function looksLikeQuestionHeader(line: string): boolean {
 function getAllLikelyQuestionHeaderPositions(text: string): number[] {
   const headers: number[] = [];
   const patterns: RegExp[] = [
-    /(^|\n)\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/gm,
-    /(^|\n)\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)\s*[:：.．、)）]?/gm,
-    /(^|\n)\s*\(\s*\d{1,4}\s*\)\s*/gm,
+    // Support both line-start and "inline" (PDF/text flattening) headers by allowing a non-digit boundary.
+    /(^|[^\d])\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/gm,
+    /(^|[^\d])\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)\s*[:：.．、)）]?/gm,
+    /(^|[^\d])\s*\(\s*\d{1,4}\s*\)\s*/gm,
   ];
 
   for (const re of patterns) {
@@ -1135,8 +1417,19 @@ export async function POST(req: NextRequest) {
     const fallbackTokens = (defTopic ? [defTopic, ...qTokens] : qTokens).filter(Boolean).slice(0, 8);
     const filterTokens = strongTokens.length > 0 ? strongTokens : fallbackTokens;
 
-    const filteredRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
-    const finalRelevantChunks = filteredRelevant.length >= Math.min(LLM_TOP_K, 3) ? filteredRelevant : relevantChunks;
+    // For longer questions, require 2+ token hits to avoid "vaguely related" chunks.
+    const minHits =
+      (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) && !defTopic && !focus.topic ? 2 : 1;
+
+    const filteredRelevant = relevantChunks.filter((r) => countTokenMatchesLoose(r.content, filterTokens) >= minHits);
+    const relaxedRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
+
+    const finalRelevantChunks =
+      filteredRelevant.length >= 1
+        ? filteredRelevant
+        : relaxedRelevant.length >= Math.min(LLM_TOP_K, 2)
+          ? relaxedRelevant
+          : relevantChunks;
 
     // Build base sources (full chunk content) for the LLM.
     const baseSources: SourceChunk[] = finalRelevantChunks.map((row, index) => {
@@ -1181,7 +1474,16 @@ export async function POST(req: NextRequest) {
         return picked;
       }
 
-      return baseSources.slice(0, LLM_TOP_K);
+      // Default: prefer sources that match more query tokens.
+      const rankTokens = filterTokens.length > 0 ? filterTokens : qTokens;
+      return baseSources
+        .slice()
+        .sort(
+          (a, b) =>
+            countTokenMatchesLoose(b.content, rankTokens) - countTokenMatchesLoose(a.content, rankTokens) ||
+            b.similarity - a.similarity
+        )
+        .slice(0, LLM_TOP_K);
     })();
 
     // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
@@ -1196,6 +1498,13 @@ export async function POST(req: NextRequest) {
         if (refined) {
           return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
         }
+      }
+
+      // For numbered Q/A style notes (pdf/txt/docx) where the question text exists verbatim,
+      // prefer matching the question line to avoid drifting into adjacent questions.
+      const qaRefined = refineRangeByNumberedQaQuestionText(s.content, s.startChar, retrievalQuestion, 520);
+      if (qaRefined) {
+        return { ...s, content: qaRefined.content, startChar: qaRefined.startChar, endChar: qaRefined.endChar };
       }
 
       if (qNum) {
@@ -1247,8 +1556,10 @@ export async function POST(req: NextRequest) {
       focusAspect: focus.aspectWord,
     });
 
+    const normalizedAnswer = normalizeAnswerCitationsToAvailableSources(result.answer, uiSources);
+
     return NextResponse.json({
-      answer: result.answer,
+      answer: normalizedAnswer,
       sources: uiSources,
       hasAnswer: result.hasAnswer,
       rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,

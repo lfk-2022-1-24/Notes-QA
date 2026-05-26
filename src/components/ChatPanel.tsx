@@ -70,7 +70,12 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
   const extractCitedSourceIndices = (answerText: string): Set<number> => {
     const set = new Set<number>();
     if (!answerText) return set;
-    for (const m of answerText.matchAll(/\[(\d+)\]/g)) {
+    // Support common variants:
+    // - [3]
+    // - ［3］ (full-width)
+    // - 【3】
+    // - [Source 3]
+    for (const m of answerText.matchAll(/[\[［【]\s*(?:source\s*)?(\d+)\s*[\]］】]/gi)) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) set.add(n);
     }
@@ -211,11 +216,11 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
       .replace(/__([^_]+)__/g, "$1")
       .replace(/_([^_]+)_/g, "$1");
 
-    // Split by citation patterns like [1], [2], [1][3] etc.
-    const parts = cleaned.split(/(\[\d+\])/g);
+    // Split by citation patterns like [1], ［1］, 【1】, [Source 1] etc.
+    const parts = cleaned.split(/([\[［【]\s*(?:source\s*)?\d+\s*[\]］】])/gi);
 
     return parts.map((part, i) => {
-      const citationMatch = part.match(/^\[(\d+)\]$/);
+      const citationMatch = part.match(/^[\[［【]\s*(?:source\s*)?(\d+)\s*[\]］】]$/i);
       if (citationMatch) {
         const sourceIndex = parseInt(citationMatch[1]);
         const source = msgSources.find((s) => s.index === sourceIndex);
