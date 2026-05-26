@@ -210,10 +210,12 @@ function refineRangeByNumberedQaQuestionText(
   const qNorm = normalizeForLooseSearch(question);
   if (!qNorm || qNorm.length < 4) return null;
 
-  // Typical extraction format (pdf/txt/docx flattening): "33. 问：...？ 答：..."
+  // Typical extraction format (pdf/txt/docx flattening):
+  // - "33. 问：...？ 答：..."
+  // - "9. ...的区别？ 解答：..."
   // NOTE: Many parsers flatten line breaks into spaces, so we cannot rely on '\n'.
   // Use a non-digit boundary instead to find headers in the middle of a long line.
-  const headerRe = /(^|[^\d])(\d{1,4})\s*[.．、)]\s*问\s*[:：]/gm;
+  const headerRe = /(^|[^\d])(\d{1,4})\s*[.．、)]\s*(?:问\s*[:：])?/gm;
   const headers: { idx: number; num: number }[] = [];
   for (const m of text.matchAll(headerRe)) {
     const prefix = m[1] ?? "";
@@ -225,7 +227,9 @@ function refineRangeByNumberedQaQuestionText(
   if (headers.length === 0) return null;
 
   const tokens0 = extractMatchTokensFromQuestion(question);
-  const tokens = filterTokensByRarityInText(text, tokens0);
+  const localFocus = extractFocus(question);
+  const focusTokens = [localFocus.topic, localFocus.aspectWord].filter((x): x is string => Boolean(x));
+  const tokens = filterTokensByRarityInText(text, Array.from(new Set([...focusTokens, ...tokens0])));
 
   let best: { startIdx: number; endIdx: number; score: number } | null = null;
 
@@ -236,12 +240,32 @@ function refineRangeByNumberedQaQuestionText(
 
     const block = text.slice(startIdx, endIdx);
     const qMark = block.search(/问\s*[:：]/);
-    if (qMark < 0) continue;
-    const aMark = block.search(/答\s*[:：]/);
-    const qTextRaw =
-      aMark > qMark ? block.slice(qMark + 2, aMark) : block.slice(qMark + 2, Math.min(block.length, qMark + 180));
+    const aMark = block.search(/(?:解答|答案|答)\s*[:：]/);
+
+    // Extract a short "question line" for scoring.
+    const qStart = qMark >= 0 ? qMark + 2 : 0;
+    let qEnd = -1;
+    if (aMark > qStart) qEnd = aMark;
+    const qm = block.search(/[?？]/);
+    if (qm >= 0 && (qEnd < 0 || qm < qEnd) && qm > qStart) qEnd = qm + 1;
+    if (qEnd < 0) qEnd = Math.min(block.length, qStart + 180);
+
+    const qTextRaw = block.slice(qStart, qEnd);
     const qText = qTextRaw.replace(/\s+/g, " ").trim();
     if (qText.length < 6) continue;
+
+    const usedTokens = tokens.length > 0 ? tokens : Array.from(new Set([...focusTokens, ...tokens0]));
+    const hit = countTokenMatchesLoose(qText, usedTokens);
+
+    // Guard: avoid matching ordered list items that are not Q/A.
+    // Accept if:
+    // - explicit 问/答 markers exist, OR
+    // - question mark + answer marker exist, OR
+    // - the header line is an "aspect/diff" style item (优缺点/区别/是什么...) and matches 2+ query tokens.
+    const hasQaMarkers = qMark >= 0 || aMark >= 0;
+    const hasQuestionMark = /[?？]/.test(qText);
+    const looksLikeAspectItem = /(优点|缺点|优缺点|区别|对比|不同|是什么|定义|含义|原理|机制|作用|意义)/.test(qText);
+    if (!hasQaMarkers && !(hasQuestionMark && aMark >= 0) && !(looksLikeAspectItem && hit >= 2)) continue;
 
     const qTextNorm = normalizeForLooseSearch(qText);
     let score = 0;
@@ -250,7 +274,6 @@ function refineRangeByNumberedQaQuestionText(
     if (qTextNorm && (qNorm.includes(qTextNorm) || qTextNorm.includes(qNorm))) score += 12;
 
     // Token overlap within the question line (not the whole answer) is a strong signal.
-    const hit = countTokenMatchesLoose(qText, tokens.length > 0 ? tokens : tokens0);
     score += hit * 3;
 
     // Prefer blocks whose question line ends with a question mark.
@@ -369,7 +392,25 @@ function refineRangeByDefinitionTopic(
   const bounds = getSentenceBounds(text, matchIdx, { maxLen: 220 });
   // For "definition topic", never include content before the topic occurrence itself.
   const startIdx = Math.max(matchIdx, bounds.startIdx);
-  const endIdx = bounds.endIdx;
+  let endIdx = bounds.endIdx;
+
+  // Many notes are "definition line + numbered list" flattened into one paragraph, e.g.
+  // "反射？（...） 12. ... 13. ...". In this case, cut strictly before the next numbered header
+  // to avoid drifting into adjacent Q/A items.
+  {
+    const lookAhead = text.slice(startIdx, Math.min(text.length, startIdx + 900));
+    const nextHeader = lookAhead.match(/(^|[^\d])\s*\d{1,4}\s*[.．、)]\s+/m);
+    if (nextHeader && nextHeader.index !== undefined) {
+      const rel = nextHeader.index + (nextHeader[1]?.length ?? 0);
+      // Only treat it as a boundary if it is not immediately at the start (avoid cutting "1. ..." within term text)
+      if (rel >= 18) {
+        endIdx = Math.min(endIdx, startIdx + rel);
+      }
+    }
+  }
+
+  // Hard cap for definition snippets.
+  if (endIdx - startIdx > 240) endIdx = startIdx + 240;
   const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
   const snippet = chunkContent.slice(mapped.start, mapped.end);
   if (!snippet.trim()) return null;
@@ -1410,12 +1451,19 @@ export async function POST(req: NextRequest) {
     // Post-filter: keep only chunks that contain at least one strong query token.
     // This reduces "answer is correct but citations drift to unrelated blocks" (common for txt notes).
     const qTokens = extractMatchTokensFromQuestion(retrievalQuestion);
+    const focusTokens = [focus.topic, focus.aspectWord].filter((x): x is string => Boolean(x)).slice(0, 2);
+
     const strongTokens = (defTopic ? [defTopic, ...qTokens] : qTokens)
       .filter(Boolean)
       .filter((t) => t.length >= 3)
       .slice(0, 8);
-    const fallbackTokens = (defTopic ? [defTopic, ...qTokens] : qTokens).filter(Boolean).slice(0, 8);
-    const filterTokens = strongTokens.length > 0 ? strongTokens : fallbackTokens;
+    const fallbackTokens = (defTopic ? [defTopic, ...qTokens] : qTokens).filter(Boolean).slice(0, 10);
+
+    // IMPORTANT: for "topic + aspect" questions, the most important tokens can be 2-char Chinese words
+    // (e.g. "反射"/"优点"). Always include them to avoid filtering out the correct chunk.
+    const filterTokens = Array.from(
+      new Set<string>([...focusTokens, ...(strongTokens.length > 0 ? strongTokens : fallbackTokens)])
+    ).slice(0, 12);
 
     // For longer questions, require 2+ token hits to avoid "vaguely related" chunks.
     const minHits =
