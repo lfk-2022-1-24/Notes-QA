@@ -8,6 +8,10 @@ const deepseekClient = new OpenAI({
 const CHAT_MODEL = process.env.DEEPSEEK_CHAT_MODEL || "deepseek-v4-pro";
 const LLM_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_TIMEOUT_MS || "20000");
 
+// Internal sentinel for "no relevant info" detection.
+// We never want to show this raw string to end users; the API layer should translate it.
+const NO_RELEVANT_INFO_SENTINEL = "__NO_RELEVANT_INFO__";
+
 export interface SourceChunk {
   index: number;
   noteId: string;
@@ -40,7 +44,7 @@ Rules:
 1. Answer the question using ONLY information from the provided sources.
 2. For EVERY claim in your answer, cite the source number in square brackets, like [1] or [2].
 3. If multiple sources support a claim, cite all of them: [1][3].
-4. If the sources do not contain enough information to answer the question, say: "I could not find relevant information in your notes to answer this question."
+4. If the sources do not contain enough information to answer the question, output EXACTLY: "__NO_RELEVANT_INFO__"
 5. Do NOT make up information that is not in the sources.
 6. Do NOT use external knowledge to supplement the answer.
 7. Output as plain text only. Do NOT use markdown formatting such as bullets, *, **, headers, or code fences.`;
@@ -123,7 +127,7 @@ export async function askQuestion(
 ): Promise<AskResult> {
   if (sources.length === 0) {
     return {
-      answer: "I could not find relevant information in your notes to answer this question.",
+      answer: NO_RELEVANT_INFO_SENTINEL,
       sources: [],
       hasAnswer: false,
     };
@@ -158,7 +162,11 @@ export async function askQuestion(
   const answer = response.choices[0]?.message?.content || "";
 
   // Check if the answer indicates no information found
-  const hasAnswer = !answer.includes("could not find relevant information");
+  const normalized = answer.trim();
+  const hasAnswer =
+    normalized !== NO_RELEVANT_INFO_SENTINEL &&
+    !normalized.includes("could not find relevant information") &&
+    !normalized.includes("__NO_RELEVANT_INFO__");
 
   return { answer, sources, hasAnswer };
 }

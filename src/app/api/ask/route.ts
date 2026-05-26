@@ -770,7 +770,6 @@ function getTightBounds(text: string, matchIdx: number): { startIdx: number; end
   const paraLen = paraEnd - paraStart;
   if (paraLen > 480) {
     // Sentence punctuation boundaries (CN + EN) or line breaks.
-    const sentStops = /[。！？!?；;]\s|\n/;
     // Find sentence start
     let sStart = Math.max(0, idx - 1);
     while (sStart > 0) {
@@ -1053,24 +1052,6 @@ function refineRangeByMarkdownLineMatch(
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
 }
 
-function getAllQuestionHeaderPositions(text: string): number[] {
-  const headers: number[] = [];
-  const patterns: RegExp[] = [
-    /(^|\n)\s*(?:Q\s*)?\d{1,4}\s*[:：.．、)）]/gm, // 14. / 14、 / Q14:
-    /(^|\n)\s*第\s*\d{1,4}\s*(?:题|问|个问题|问题)\s*[:：.．、)）]?/gm, // 第14题
-    /(^|\n)\s*\(\s*\d{1,4}\s*\)\s*/gm, // (14)
-  ];
-
-  for (const re of patterns) {
-    for (const m of text.matchAll(re)) {
-      if (m.index === undefined) continue;
-      const prefix = m[1] ?? "";
-      headers.push(m.index + prefix.length);
-    }
-  }
-  return headers.sort((a, b) => a - b);
-}
-
 function looksLikeQuestionHeader(line: string): boolean {
   const s = line.trim();
   if (!s) return false;
@@ -1203,29 +1184,6 @@ function extractFocus(question: string): QuestionFocus {
   }
 
   return {};
-}
-
-function clipToFocusedSection(content: string, focus: QuestionFocus): string {
-  if (!focus.topic) return content;
-  const topic = focus.topic;
-  const aspectWord = focus.aspectWord;
-  const text = content.replace(/\r\n/g, "\n");
-
-  const idxTopic = text.indexOf(topic);
-  if (idxTopic < 0) return content;
-
-  // Prefer to clip around aspect ("缺点"/"优点") within the same chunk if present.
-  let idx = idxTopic;
-  if (aspectWord) {
-    const near = text.indexOf(aspectWord, Math.max(0, idxTopic - 200));
-    if (near >= 0) idx = near;
-  }
-
-  // Keep this window relatively small so citation highlighting is precise.
-  // (The raw chunk is still stored in DB; this is only what we return to UI/LLM.)
-  const start = Math.max(0, idx - 120);
-  const end = Math.min(text.length, idx + 420);
-  return text.slice(start, end);
 }
 
 export async function POST(req: NextRequest) {
@@ -1611,6 +1569,28 @@ export async function POST(req: NextRequest) {
       focusTopic: focus.topic ?? defTopic ?? undefined,
       focusAspect: focus.aspectWord,
     });
+
+    const isClarifyMarker = (s: string) => s.includes("【需要补充上下文】");
+    const lastTurn = safeHistory.at(-1);
+    const askedClarifyLastTurn = Boolean(lastTurn?.answer && isClarifyMarker(lastTurn.answer));
+
+    // Two-stage behavior when retrieval/grounding fails:
+    // - 1st time: ask user to clarify instead of claiming "no info"
+    // - 2nd time (after user follow-up): be explicit that notes don't contain relevant material
+    if (!result.hasAnswer) {
+      const stage1 = `【需要补充上下文】\n我在当前笔记里暂时没检索到能直接回答你这个问题的内容。你可以补充一下：\n（1）你说的关键术语/对象具体指什么？（可以给全称、同义词、英文缩写）\n或者\n（2）如果你手头有相关段落/关键词，请直接贴出来或上传对应资料。`;
+
+      const stage2 = `我在当前已上传的笔记中仍然没有检索到与该问题直接相关、可用于作答的资料。\n如果你希望我继续回答，请上传/补充相关笔记（或把关键段落贴出来），我再基于新增资料进行检索与问答。`;
+
+      return NextResponse.json({
+        answer: askedClarifyLastTurn ? stage2 : stage1,
+        sources: [],
+        // For stage1 we treat it as a follow-up prompt (avoid "no sources" warning UI);
+        // for stage2 we mark as no-answer so UI can highlight the limitation.
+        hasAnswer: askedClarifyLastTurn ? false : true,
+        rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+      });
+    }
 
     const normalizedAnswer = normalizeAnswerCitationsToAvailableSources(result.answer, uiSources);
 
