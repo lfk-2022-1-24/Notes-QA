@@ -1962,13 +1962,19 @@ export async function POST(req: NextRequest) {
         return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
       }
 
-      // Date-scoped log summary: keep only sources that contain the exact date heading to avoid extra/mismatched citations.
+      // Date-scoped queries: ensure at least one chunk per note (md/pdf/txt) can be returned when it contains the date.
       if (dateHint) {
-        const arr = baseSources.filter((s) => {
-          const refined = refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 200);
-          return Boolean(refined && includesDateLoose(refined.content, dateHint));
-        });
-        return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
+        const variants = pickYearfulDateVariants(dateHint, dateVariants.length > 0 ? dateVariants : [dateHint]);
+        const perNote = new Map<string, SourceChunk>();
+        for (const s of baseSources) {
+          const ok =
+            variants.some((v) => includesDateLoose(s.filename, v) || includesDateLoose(s.content, v)) ||
+            Boolean(refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 240));
+          if (!ok) continue;
+          if (!perNote.has(s.noteId)) perNote.set(s.noteId, s);
+        }
+        const picked = Array.from(perNote.values());
+        return (picked.length > 0 ? picked : baseSources).slice(0, LLM_TOP_K);
       }
 
       if (topicHint) {
