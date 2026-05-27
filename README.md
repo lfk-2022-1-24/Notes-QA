@@ -1,36 +1,15 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Notes QA
 
-## Getting Started
+## 我做了什么
 
-First, run the development server:
+我实现了一个“把你的笔记当作唯一事实来源”的 Notes QA 原型：你可以上传自己的笔记（支持 `.md/.txt/.pdf/.docx`），系统会解析文本、按段落/句子分块并生成向量，存入 Postgres（pgvector）。提问时服务端会做向量检索 + 关键词召回（embedding 不可用时自动降级为纯关键词检索），把命中的文本块作为 `[Source n]` 提供给 LLM，并强制“每个论点都必须带引用 [n]；若资料不足则明确无答案”。前端把回答中的 `[n]` 渲染为可点击引用，点击后会自动展开对应笔记并按 `start_char/end_char` 高亮到具体段落，方便人工核验。对于笔记里没有答案的问题，系统会先请求你补充上下文；如果追问后仍无证据，则明确说明当前笔记无法支撑作答。
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+（本地运行）配置环境变量 `DATABASE_URL`、`ARK_API_KEY`、`DEEPSEEK_API_KEY`（可选：`ARK_*`、`DEEPSEEK_*` 模型/超时），然后 `npm i && npm run dev`。
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## 我选择不做什么（以及为什么）
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+我刻意把范围收敛在“端到端可用 + 引用诚实可核验”上，因此没有做：多用户/登录与权限（会引入账号体系与数据隔离复杂度，但不提升核心评测信号）；第三方同步（Notion/Obsidian/网盘）与增量索引（上传文件足以覆盖评测）；流式输出与复杂对话编排（更好体验但会增加前后端状态复杂度）；OCR、图片/表格型 PDF 结构化抽取（是深坑，且评测主要看文本问答）；重排序模型、BM25 独立索引等更复杂检索优化（在 20–200 篇笔记规模下，混合召回已足够验证 grounded-answer 体验）。
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 如果再给我 3 天，我会做的一件不同的事
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+我会把“可追溯性”从“引用可点击”升级成“引用可验证”：在服务端对答案进行**逐句/逐 claim 的证据校验**（例如把每个句子与被引用 sources 做相似度/关键短语覆盖检查，发现弱引用就要求模型重写或改为“无法从笔记得出”），并把“证据片段”直接作为结构化结果返回（而不是只返回 chunk）。这会显著降低“引用贴得很近但并不支持该结论”的风险，让评测者更快确认每个结论是否真的被原文支撑，同时也能更稳定地处理“笔记里确实没有答案”的场景。

@@ -1921,6 +1921,13 @@ function chunkHasMeetingRecordHeadingId(content: string, recordId: string): bool
   return re.test(text);
 }
 
+function fileExtLower(filename: string): string {
+  const name = String(filename || "").toLowerCase();
+  const idx = name.lastIndexOf(".");
+  if (idx < 0) return "";
+  return name.slice(idx + 1);
+}
+
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
   if (tokens.length === 0) return null;
 
@@ -3332,7 +3339,7 @@ export async function POST(req: NextRequest) {
          WHERE ${where}
          ORDER BY n.id
          LIMIT $1`,
-        [6, ...likes]
+        [20, ...likes]
       );
 
       const picked: SourceChunk[] = [];
@@ -3361,7 +3368,33 @@ export async function POST(req: NextRequest) {
       }
 
       // Only activate when we truly found multiple distinct notes.
-      if (picked.length >= 2) recordOverviewPerNoteSources = picked.slice(0, LLM_TOP_K);
+      // Also try to include one source per file type (md/txt/pdf/docx) when available.
+      if (picked.length >= 2) {
+        const preferredExts = ["txt", "md", "pdf", "docx"];
+        const byExt = new Map<string, SourceChunk[]>();
+        for (const s of picked) {
+          const ext = fileExtLower(s.filename);
+          if (!byExt.has(ext)) byExt.set(ext, []);
+          byExt.get(ext)!.push(s);
+        }
+        const out: SourceChunk[] = [];
+        const seenKey = new Set<string>();
+        const push = (s: SourceChunk) => {
+          const key = `${s.noteId}:${s.startChar}:${s.endChar}`;
+          if (seenKey.has(key)) return;
+          seenKey.add(key);
+          out.push(s);
+        };
+        for (const ext of preferredExts) {
+          const arr = byExt.get(ext) || [];
+          if (arr.length > 0) push(arr[0]!);
+        }
+        for (const s of picked) {
+          if (out.length >= LLM_TOP_K) break;
+          push(s);
+        }
+        recordOverviewPerNoteSources = out.slice(0, LLM_TOP_K);
+      }
     }
 
     // If user did not use a recognizable "中提到的/的..." phrasing, try to infer subtopics directly
