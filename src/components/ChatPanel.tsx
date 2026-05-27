@@ -324,9 +324,15 @@ export default function ChatPanel({ onCitationClick }: ChatPanelProps) {
             {(() => {
               if (m.sources.length === 0) return null;
               const cited = extractCitedSourceIndices(typeof m.answer === "string" ? m.answer : "");
-              const displaySources = m.sources
-                .filter((s) => cited.has(s.index))
-                .sort((a, b) => a.index - b.index);
+              const displaySources =
+                cited.size > 0
+                  ? m.sources.filter((s) => cited.has(s.index)).sort((a, b) => a.index - b.index)
+                  : // Fallback: if the model forgets citations but we do have sources,
+                    // still show the top sources so users can inspect evidence.
+                    m.sources
+                      .slice()
+                      .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0) || a.index - b.index)
+                      .slice(0, 3);
               if (displaySources.length === 0) return null;
 
               return (

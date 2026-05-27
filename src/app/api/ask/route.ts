@@ -18,25 +18,27 @@ function normalizeAnswerCitationsToAvailableSources(answer: string, sources: Sou
   if (!answer || sources.length === 0) return answer;
   const available = new Set<number>(sources.map((s) => s.index).filter((n) => Number.isFinite(n)));
   if (available.size === 0) return answer;
-  const sorted = Array.from(available).sort((a, b) => a - b);
-  const maxIdx = sorted[sorted.length - 1]!;
 
-  // If the model emits a citation number that we didn't return (e.g. [3] while we only have [1]),
-  // remap it to the closest available index so the UI can still show a source.
-  return answer.replace(/\[(\d+)\]/g, (full, g1) => {
+  // Be strict: never "remap" unknown citations to an unrelated source.
+  // Instead, drop invalid citations and normalize supported variants to [n].
+  return answer.replace(/[\[［【]\s*(?:source\s*)?(\d+)\s*[\]］】]/gi, (full, g1) => {
     const n = Number.parseInt(String(g1), 10);
     if (!Number.isFinite(n)) return full;
-    if (available.has(n)) return full;
-    // clamp to closest: below 1 -> first, above max -> last, otherwise nearest lower.
-    if (n <= sorted[0]!) return `[${sorted[0]}]`;
-    if (n >= maxIdx) return `[${maxIdx}]`;
-    let lower = sorted[0]!;
-    for (const v of sorted) {
-      if (v <= n) lower = v;
-      else break;
-    }
-    return `[${lower}]`;
+    if (!available.has(n)) return "";
+    return `[${n}]`;
   });
+}
+
+function ensureAnswerHasAtLeastOneCitation(answer: string, sources: SourceChunk[]): string {
+  const a = String(answer || "");
+  if (!a.trim() || !sources || sources.length === 0) return a;
+  const hasAnyCitation = /[\[［【]\s*(?:source\s*)?\d+\s*[\]］】]/i.test(a);
+  if (hasAnyCitation) return a;
+
+  // If the model forgets citations entirely but we do have sources, add a minimal honest citation.
+  // Prefer the first source (already ranked for UI).
+  const idx = Number.isFinite(sources[0]?.index) ? sources[0]!.index : 1;
+  return `${a.trim()} [${idx}]`;
 }
 
 type SearchRow = {
@@ -642,6 +644,17 @@ function refineRangeByNumberedQaQuestionText(
     const qStart = qMark >= 0 ? qMark + 2 : 0;
     let qEnd = -1;
     if (aMark > qStart) qEnd = aMark;
+    // Many "八股" style notes embed the answer in parentheses right after the question,
+    // e.g. "18. 针对NIO的轮询 产生了什么技术（IO多路复用：...）" without a '?' or 问/答 markers.
+    // Treat the first parenthesis as a boundary for the question line.
+    const parenIdx = (() => {
+      const i1 = block.indexOf("（", qStart);
+      const i2 = block.indexOf("(", qStart);
+      if (i1 < 0) return i2;
+      if (i2 < 0) return i1;
+      return Math.min(i1, i2);
+    })();
+    if (parenIdx > qStart && (qEnd < 0 || parenIdx < qEnd)) qEnd = parenIdx;
     const qm = block.search(/[?？]/);
     if (qm >= 0 && (qEnd < 0 || qm < qEnd) && qm > qStart) qEnd = qm + 1;
     if (qEnd < 0) qEnd = Math.min(block.length, qStart + 180);
@@ -663,10 +676,13 @@ function refineRangeByNumberedQaQuestionText(
     const qmInBlock = block.search(/[?？]/);
     const hasParenAnswerNearQ =
       qmInBlock >= 0 && /[（(]/.test(block.slice(qmInBlock + 1, Math.min(block.length, qmInBlock + 12)));
+    const hasInlineParenAnswer =
+      parenIdx >= 0 && parenIdx < Math.min(block.length, qStart + 220) && /[（(]/.test(block[parenIdx] || "");
     const looksLikeAspectItem = /(优点|缺点|优缺点|区别|对比|不同|是什么|定义|含义|原理|机制|作用|意义)/.test(qText);
     if (
       !hasQaMarkers &&
       !(hasQuestionMark && (aMark >= 0 || hasParenAnswerNearQ) && hit >= 1) &&
+      !(hasInlineParenAnswer && hit >= 1) &&
       !(looksLikeAspectItem && hit >= 2)
     )
       continue;
@@ -751,6 +767,52 @@ function extractInclusionTopic(question: string): string | null {
     const topic = (m2[1] || "").trim();
     return topic.length >= 2 ? topic : null;
   }
+  return null;
+}
+
+function extractComparisonTopics(question: string): { a: string; b: string } | null {
+  const q0 = (question || "").trim();
+  if (!q0) return null;
+
+  const clean = (s: string) =>
+    (s || "")
+      .trim()
+      .replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/的$/g, "")
+      .trim();
+
+  // Chinese: "A和B的区别" / "A与B有什么不同" / "A和B对比"
+  const patterns: RegExp[] = [
+    /^(.+?)\s*(?:和|与|及)\s*(.+?)\s*(?:的)?\s*(?:区别|差异|不同(?:点)?|对比|比较)(?:是|有哪些|有什么)?\s*[?？呀啊呢吗]*$/u,
+    /^(?:请问|帮我|解释一下|说明一下)?\s*(.+?)\s*(?:和|与|及)\s*(.+?)\s*(?:有什么|有哪些)?\s*(?:区别|差异|不同(?:点)?|对比|比较)\s*[?？呀啊呢吗]*$/u,
+  ];
+
+  for (const re of patterns) {
+    const m = q0.match(re);
+    if (m) {
+      const a = clean(m[1] || "");
+      const b = clean(m[2] || "");
+      if (a.length >= 2 && b.length >= 2 && a !== b) return { a, b };
+    }
+  }
+
+  // English: "difference between A and B"
+  const e1 = q0.match(/\bdifference\s+between\s+(.+?)\s+and\s+(.+?)\??$/i);
+  if (e1) {
+    const a = clean(e1[1] || "");
+    const b = clean(e1[2] || "");
+    if (a.length >= 2 && b.length >= 2 && a !== b) return { a, b };
+  }
+
+  // "A vs B"
+  const e2 = q0.match(/^(.+?)\s*(?:vs\.?|versus)\s*(.+?)\s*$/i);
+  if (e2) {
+    const a = clean(e2[1] || "");
+    const b = clean(e2[2] || "");
+    if (a.length >= 2 && b.length >= 2 && a !== b) return { a, b };
+  }
+
   return null;
 }
 
@@ -1492,6 +1554,214 @@ function computeMeetingRecordSectionBounds(
   const start = heads[idx]!.startChar;
   const end = heads[idx + 1]?.startChar ?? Number.POSITIVE_INFINITY;
   return { start, end };
+}
+
+const RESEARCH_SUMMARY_TAIL_SUFFIXES = [
+  "实验结果",
+  "实验指标",
+  "实验设置",
+  "训练策略",
+  "优化策略",
+  "性能分析",
+  "方法研究",
+  "框架设计",
+  "应用探索",
+  "性能评估",
+];
+
+function extractResearchSummaryIdHint(question: string): string | null {
+  const q = (question || "").trim();
+  if (!q) return null;
+  const m = q.match(/(?:研究摘要|摘要)\s*0*(\d{1,4})(?![0-9])/);
+  if (!m) return null;
+  const n = Number.parseInt(m[1]!, 10);
+  if (!Number.isFinite(n)) return null;
+  return String(n).padStart(3, "0");
+}
+
+function extractResearchSummaryTopicCore(question: string): string | null {
+  let q = (question || "").trim();
+  if (!q) return null;
+
+  const original = q;
+  q = q.replace(/(?:研究摘要|摘要)\s*0*\d{1,4}\s*[:：]?\s*/g, "").trim();
+
+  for (const suffix of RESEARCH_SUMMARY_TAIL_SUFFIXES.slice().sort((a, b) => b.length - a.length)) {
+    if (q.endsWith(suffix)) {
+      q = q.slice(0, -suffix.length).replace(/的$/g, "").trim();
+    }
+  }
+
+  if (q.length < 4) return null;
+
+  const hasExplicitId = /(?:研究摘要|摘要)\s*0*\d{1,4}/.test(original);
+  const hasResearchTail = RESEARCH_SUMMARY_TAIL_SUFFIXES.some((s) => original.includes(s));
+  const hasTechnicalTopic =
+    /(?:机制|学习|预测|图谱|模型|联邦|检测|挖掘|分割|工程|融合|微服务|多模态|图神经|对比学习|自监督|提示工程|缺陷|视觉|流式|异常)/.test(
+      q
+    );
+
+  if (!hasExplicitId && !(hasResearchTail && (hasTechnicalTopic || q.length >= 8))) return null;
+  return q;
+}
+
+function extractResearchTopicMatchTokens(topic: string): string[] {
+  const q = (topic || "").trim().replace(/[?？!！。，,;；:："'“”‘’（）()【】\[\]{}<>]/g, "");
+  if (!q) return [];
+  const stop = new Set(["基于", "关于", "针对", "一种", "方法", "研究", "分析", "优化", "设计", "探索", "框架"]);
+  const out = new Set<string>();
+  for (const p of q.split("的").filter(Boolean)) {
+    const s = p.trim();
+    if (s.length >= 2 && !stop.has(s)) out.add(s);
+  }
+  for (const m of q.matchAll(/[\p{Script=Han}A-Za-z0-9]{2,}/gu)) {
+    const s = m[0];
+    if (s.length >= 2 && !stop.has(s)) out.add(s);
+  }
+  const hanOnly = (q.match(/\p{Script=Han}+/gu) || []).join("");
+  for (let n = 4; n >= 2; n--) {
+    for (let i = 0; i + n <= hanOnly.length; i++) {
+      const g = hanOnly.slice(i, i + n);
+      if (!stop.has(g)) out.add(g);
+    }
+  }
+  return Array.from(out).sort((a, b) => b.length - a.length).slice(0, 8);
+}
+
+function scoreResearchTitleMatch(title: string, topicCore: string, question: string): number {
+  let score = 0;
+  for (const t of extractResearchTopicMatchTokens(topicCore)) {
+    if (includesTopicLoose(title, t)) score++;
+  }
+  if (includesTopicLoose(title, topicCore)) score += 3;
+  if (includesLoose(question, title)) score += 5;
+  return score;
+}
+
+function computeResearchSummarySectionBoundsFromNoteContent(
+  noteContent: string,
+  summaryId: string
+): { start: number; end: number; id: string; title: string } | null {
+  const raw = String(noteContent || "");
+  if (!raw) return null;
+  const idCore = (summaryId || "").replace(/^0+/, "") || summaryId;
+  if (!idCore) return null;
+  const re = new RegExp(
+    String.raw`^\s*#\s*研究摘要\s*0*${escapeRegExp(idCore)}(?![0-9])\s*[:：]\s*(.+?)\s*$`,
+    "m"
+  );
+  const headings: { idx: number; id: string; title: string }[] = [];
+  for (const m of raw.matchAll(new RegExp(re.source, "gm"))) {
+    if (m.index === undefined) continue;
+    headings.push({ idx: m.index, id: String(Number.parseInt(idCore, 10)).padStart(3, "0"), title: (m[1] || "").trim() });
+  }
+  if (headings.length === 0) return null;
+  headings.sort((a, b) => a.idx - b.idx);
+  const target = headings[0]!;
+  const nextRe = /^\s*#\s*研究摘要\s*0*\d{1,4}(?![0-9])\s*[:：]/gm;
+  let end = raw.length;
+  for (const m of raw.matchAll(nextRe)) {
+    if (m.index !== undefined && m.index > target.idx) {
+      end = m.index;
+      break;
+    }
+  }
+  return { start: target.idx, end, id: target.id, title: target.title };
+}
+
+function findResearchSummarySectionByTopic(
+  noteContent: string,
+  topicCore: string,
+  question: string
+): { start: number; end: number; id: string; title: string } | null {
+  const raw = String(noteContent || "");
+  if (!raw || !topicCore.trim()) return null;
+  const re = /^\s*#\s*研究摘要\s*0*(\d{1,4})(?![0-9])\s*[:：]\s*(.+?)\s*$/gm;
+  const headings: { idx: number; id: string; title: string }[] = [];
+  for (const m of raw.matchAll(re)) {
+    if (m.index === undefined) continue;
+    const n = Number.parseInt(m[1]!, 10);
+    if (!Number.isFinite(n)) continue;
+    headings.push({ idx: m.index, id: String(n).padStart(3, "0"), title: (m[2] || "").trim() });
+  }
+  if (headings.length === 0) return null;
+  headings.sort((a, b) => a.idx - b.idx);
+
+  let best: { idx: number; id: string; title: string; score: number } | null = null;
+  for (const h of headings) {
+    const score = scoreResearchTitleMatch(h.title, topicCore, question);
+    if (score < 2) continue;
+    if (!best || score > best.score) best = { ...h, score };
+  }
+  if (!best) return null;
+
+  const nextIdx = headings.find((h) => h.idx > best!.idx)?.idx ?? raw.length;
+  return { start: best.idx, end: nextIdx, id: best.id, title: best.title };
+}
+
+function extractResearchSubsectionByHeading(
+  sectionText: string,
+  sectionStartAbs: number,
+  headingNeedle: string,
+  maxLen = 900
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(sectionText);
+  if (!text.trim()) return null;
+  const patterns = [
+    new RegExp(String.raw`^\s*##\s*\d+\.\s*${escapeRegExp(headingNeedle)}(?:\s*$|\s+)`, "m"),
+    new RegExp(String.raw`^\s*##\s*${escapeRegExp(headingNeedle)}(?:\s*$|\s+)`, "m"),
+    new RegExp(String.raw`^\s*###\s*${escapeRegExp(headingNeedle)}(?:\s*$|\s+)`, "m"),
+  ];
+  let idx = -1;
+  let matchLen = 0;
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m && m.index !== undefined) {
+      idx = m.index;
+      matchLen = m[0].length;
+      break;
+    }
+  }
+  if (idx < 0) return null;
+  const afterStart = idx + Math.max(matchLen, 1);
+  const after = text.slice(afterStart);
+  const nextRel = after.search(/^\s*##\s+/m);
+  const endIdx = nextRel >= 0 ? afterStart + nextRel : Math.min(text.length, idx + maxLen);
+  const mapped = mapNormRangeToOrig(map, idx, endIdx, sectionText.length);
+  const snippet = sectionText.slice(mapped.start, mapped.end);
+  if (!snippet.trim()) return null;
+  return { content: snippet, startChar: sectionStartAbs + mapped.start, endChar: sectionStartAbs + mapped.end };
+}
+
+function refineRangeByResearchSummaryHeading(
+  chunkContent: string,
+  chunkStartAbs: number,
+  summaryId: string,
+  maxLen = 1500
+): { content: string; startChar: number; endChar: number } | null {
+  const idCore = (summaryId || "").replace(/^0+/, "") || summaryId;
+  if (!idCore) return null;
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  if (!text.trim()) return null;
+  const re = new RegExp(String.raw`^\s*#\s*研究摘要\s*0*${escapeRegExp(idCore)}(?![0-9])\s*[:：]`, "m");
+  const m = text.match(re);
+  if (!m || m.index === undefined) return null;
+  const lineStart = (() => {
+    const j = text.lastIndexOf("\n", m.index!);
+    return j >= 0 ? j + 1 : 0;
+  })();
+  const afterStart = text.slice(lineStart);
+  const nextRel = afterStart.slice(1).search(/^\s*#\s*研究摘要\s*0*\d{1,4}(?![0-9])\s*[:：]/m);
+  const endIdx =
+    nextRel >= 0 ? Math.min(text.length, lineStart + 1 + nextRel) : Math.min(text.length, lineStart + maxLen);
+  const mappedRange = mapNormRangeToOrig(map, lineStart, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
+  if (!snippet.trim()) return null;
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + mappedRange.start,
+    endChar: chunkStartAbs + mappedRange.end,
+  };
 }
 
 function extractMeetingAgendaEvidenceLines(content: string, subtopic: string, maxLines = 10): string[] {
@@ -2690,6 +2960,7 @@ export async function POST(req: NextRequest) {
     const focus = extractFocus(retrievalQuestion);
     const defTopic = extractDefinitionTopic(retrievalQuestion);
     const inclusionTopic = extractInclusionTopic(retrievalQuestion);
+    const comparisonTopics = extractComparisonTopics(retrievalQuestion) ?? extractComparisonTopics(question);
     const topicHint = focus.topic ?? defTopic ?? inclusionTopic ?? undefined;
     const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
     const tailKeyphrase = extractTailKeyphrase(retrievalQuestion);
@@ -2712,6 +2983,13 @@ export async function POST(req: NextRequest) {
             id: recordIdFromHistory,
           }
         : null);
+    const researchIdHint =
+      extractResearchSummaryIdHint(question) ?? extractResearchSummaryIdHint(retrievalQuestion);
+    let researchTopicCore =
+      extractResearchSummaryTopicCore(question) ?? extractResearchSummaryTopicCore(retrievalQuestion);
+    let researchSectionBoundsDb: { noteId: string; start: number; end: number; id: string; title: string } | null =
+      null;
+    let researchSectionNoteContent: string | null = null;
     const recordTokensLoose = recordHint?.kind === "meeting" ? buildMeetingRecordTokens(recordHint.id) : [];
     const recordTokensStrict = recordHint?.kind === "meeting" ? buildMeetingRecordTokensStrict(recordHint.id) : [];
     let recordSubtopic =
@@ -2990,6 +3268,63 @@ export async function POST(req: NextRequest) {
       }));
     }
 
+    // Research-summary fallback: when the question targets a specific research abstract/topic,
+    // locate the note section directly so we don't mix "实验结果" from other abstracts.
+    let researchRows: SearchRow[] = [];
+    if ((researchIdHint || researchTopicCore) && recordHint == null) {
+      const topicTokens = researchTopicCore ? extractResearchTopicMatchTokens(researchTopicCore).slice(0, 4) : [];
+      const likes = [
+        ...(researchIdHint ? [`%研究摘要 ${researchIdHint}%`, `%研究摘要${researchIdHint}%`] : []),
+        ...topicTokens.map((t) => `%${t}%`),
+      ].slice(0, 8);
+      if (likes.length > 0) {
+        const where = likes.map((_, i) => `(c.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+        const researchResult = await query(
+          `SELECT
+            c.id,
+            c.note_id,
+            c.content,
+            c.start_char,
+            c.end_char,
+            n.filename,
+            0.0 AS similarity
+          FROM chunks c
+          JOIN notes n ON n.id = c.note_id
+          WHERE ${where}
+          ORDER BY c.id
+          LIMIT $1`,
+          [KEYWORD_K, ...likes]
+        );
+        researchRows = researchResult.rows.map((r) => ({
+          ...(r as Omit<SearchRow, "similarity">),
+          similarity: parseFloat(r.similarity),
+        }));
+      }
+
+      const noteRes = await query(
+        `SELECT id, filename, content
+         FROM notes n
+         WHERE n.content ILIKE '%研究摘要%'
+         ORDER BY n.id
+         LIMIT 12`
+      );
+      for (const row of noteRes.rows) {
+        const noteId = String(row.id || "");
+        const noteContent = String(row.content || "");
+        if (!noteId || !noteContent.trim()) continue;
+        const bounds = researchIdHint
+          ? computeResearchSummarySectionBoundsFromNoteContent(noteContent, researchIdHint)
+          : researchTopicCore
+            ? findResearchSummarySectionByTopic(noteContent, researchTopicCore, question)
+            : null;
+        if (!bounds) continue;
+        researchSectionBoundsDb = { noteId, ...bounds };
+        researchSectionNoteContent = noteContent;
+        researchTopicCore = researchTopicCore ?? bounds.title;
+        break;
+      }
+    }
+
     // Meeting-record fallback: if the question names a specific record id (e.g. "会议记录 002"),
     // recall chunks by matching the record id in content/filename.
     let recordRows: SearchRow[] = [];
@@ -3176,6 +3511,7 @@ export async function POST(req: NextRequest) {
     for (const r of dateRows) mergedKw.set(r.id, r);
     for (const r of trainingRows) mergedKw.set(r.id, r);
     for (const r of resultRows) mergedKw.set(r.id, r);
+    for (const r of researchRows) mergedKw.set(r.id, r);
     for (const r of recordRows) mergedKw.set(r.id, r);
     for (const r of recordSubtopicRows) mergedKw.set(r.id, r);
     for (const r of recordSubtopicsRows) mergedKw.set(r.id, r);
@@ -3216,6 +3552,14 @@ export async function POST(req: NextRequest) {
         if (hits >= 2) s += 6;
         else if (hits >= 1) s += 3;
       }
+      if (researchTopicCore) {
+        let hits = 0;
+        for (const t of extractResearchTopicMatchTokens(researchTopicCore)) {
+          if (includesTopicLoose(c, t)) hits++;
+        }
+        if (hits >= 2) s += 12;
+        else if (hits >= 1) s += 4;
+      }
       if (qNoPunct && c.includes(qNoPunct)) s += 2;
       if (rawQ && c.includes(rawQ)) s += 2;
       if (qNoPunct && c.includes(`Q4: ${qNoPunct}`)) s += 6;
@@ -3240,7 +3584,8 @@ export async function POST(req: NextRequest) {
     // Tail-keyphrase guard: ensure we don't miss the core intent when the query has many qualifiers.
     // Example: "基于对比学习的知识图谱性能分析的训练策略" should still retrieve chunks about "训练策略"
     // even if they don't mention "知识图谱/性能分析".
-    if (tailKeyphrase) {
+    // Skip when a research-summary section is already identified to avoid pulling unrelated abstracts.
+    if (tailKeyphrase && !researchSectionBoundsDb) {
       const must = Array.from(merged.values()).filter((r) => includesLoose(r.content, tailKeyphrase)).slice(0, TOP_K);
       if (must.length > 0 && !relevantChunks.some((r) => includesLoose(r.content, tailKeyphrase))) {
         const seen = new Set<string>();
@@ -3265,6 +3610,7 @@ export async function POST(req: NextRequest) {
     const focusTokens = Array.from(
       new Set<string>([
         ...(tailKeyphrase ? [tailKeyphrase] : []),
+        ...(researchTopicCore ? extractResearchTopicMatchTokens(researchTopicCore).slice(0, 3) : []),
         ...(trainingBoostTokens.slice(0, 2)),
         ...(resultBoostTokens.slice(0, 3)),
         ...(recordTokensLoose.slice(0, 2)),
@@ -3275,8 +3621,10 @@ export async function POST(req: NextRequest) {
 
     const strongTokens = (defTopic ? [defTopic, ...qTokens] : qTokens)
       .filter(Boolean)
-      .filter((t) => t.length >= 3)
-      .slice(0, 8);
+      // IMPORTANT: allow 2-char Chinese tokens like "轮询/阻塞/异步".
+      // These are often the only discriminative terms in short "what/why/diff" questions.
+      .filter((t) => t.length >= 2)
+      .slice(0, 10);
     const fallbackTokens = (defTopic ? [defTopic, ...qTokens] : qTokens).filter(Boolean).slice(0, 10);
 
     // IMPORTANT: for "topic + aspect" questions, the most important tokens can be 2-char Chinese words
@@ -3301,11 +3649,7 @@ export async function POST(req: NextRequest) {
     const relaxedRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
 
     const finalRelevantChunks =
-      filteredRelevant.length >= 1
-        ? filteredRelevant
-        : relaxedRelevant.length >= Math.min(LLM_TOP_K, 2)
-          ? relaxedRelevant
-          : relevantChunks;
+      filteredRelevant.length >= 1 ? filteredRelevant : relaxedRelevant.length >= 1 ? relaxedRelevant : relevantChunks;
 
     // Internal automatic second retrieval (looser):
     // If we have a strong constraint (meeting record id) but ended up with no chunks,
@@ -3375,7 +3719,10 @@ export async function POST(req: NextRequest) {
 
         return NextResponse.json({
           answer: stripMarkdownFormattingInAnswer(
-            normalizeAnswerCitationsToAvailableSources(result.answer, uiSourcesFallback)
+            ensureAnswerHasAtLeastOneCitation(
+              normalizeAnswerCitationsToAvailableSources(result.answer, uiSourcesFallback),
+              uiSourcesFallback
+            )
           ),
           sources: uiSourcesFallback,
           hasAnswer: result.hasAnswer,
@@ -3487,6 +3834,67 @@ export async function POST(req: NextRequest) {
             similarity: 0.98,
           },
         ];
+      }
+    }
+
+    // Research-summary scoping: restrict chunks to one "# 研究摘要 NNN:" section within a multi-abstract note.
+    if (
+      researchSectionBoundsDb &&
+      researchSectionNoteContent &&
+      Number.isFinite(researchSectionBoundsDb.start) &&
+      Number.isFinite(researchSectionBoundsDb.end) &&
+      recordHint == null
+    ) {
+      const { noteId, start, end, id: researchId } = researchSectionBoundsDb;
+      const scoped = baseSources
+        .filter((s) => s.noteId === noteId && Number.isFinite(s.startChar) && Number.isFinite(s.endChar))
+        .map((s) => {
+          const clipped = clipChunkToSection(s.content, s.startChar, s.endChar, start, end);
+          return clipped ? { ...s, content: clipped.content, startChar: clipped.startChar, endChar: clipped.endChar } : null;
+        })
+        .filter(Boolean) as SourceChunk[];
+
+      if (scoped.length > 0) {
+        sectionScopedSources = scoped;
+      } else {
+        const sectionText = researchSectionNoteContent.slice(start, end);
+        if (sectionText.trim()) {
+          const filename =
+            researchRows.find((r) => r.note_id === noteId)?.filename ??
+            baseSources.find((s) => s.noteId === noteId)?.filename ??
+            "research_summary";
+          const resultNeedle =
+            tailKeyphrase === "实验结果" || tailKeyphrase === "实验指标" || tailKeyphrase === "性能分析"
+              ? tailKeyphrase
+              : isResultOrExperimentQuestion(retrievalQuestion)
+                ? "实验结果"
+                : null;
+          const picked =
+            resultNeedle && extractResearchSubsectionByHeading(sectionText, start, resultNeedle)
+              ? extractResearchSubsectionByHeading(sectionText, start, resultNeedle)!
+              : { content: sectionText.slice(0, 2000), startChar: start, endChar: Math.min(end, start + 2000) };
+          sectionScopedSources = [
+            {
+              index: 1,
+              noteId,
+              filename,
+              content: picked.content,
+              startChar: picked.startChar,
+              endChar: picked.endChar,
+              similarity: 0.98,
+            },
+          ];
+        }
+      }
+
+      // When we know the summary id, refine any chunk that still spans adjacent abstracts.
+      if (researchId) {
+        sectionScopedSources = sectionScopedSources
+          .map((s) => {
+            const refined = refineRangeByResearchSummaryHeading(s.content, s.startChar, researchId, 2000);
+            return refined ? { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar } : s;
+          })
+          .filter((s) => String(s.content || "").trim().length >= 3);
       }
     }
 
@@ -3655,6 +4063,24 @@ export async function POST(req: NextRequest) {
         return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
       }
 
+      // Research-summary scoped queries: sources are already clipped to one abstract section.
+      if (researchSectionBoundsDb && recordHint == null) {
+        const rankTokens =
+          filterTokens.length > 0
+            ? filterTokens
+            : researchTopicCore
+              ? extractResearchTopicMatchTokens(researchTopicCore)
+              : qTokens;
+        return sources
+          .slice()
+          .sort(
+            (a, b) =>
+              countTokenMatchesLoose(b.content, rankTokens) - countTokenMatchesLoose(a.content, rankTokens) ||
+              b.similarity - a.similarity
+          )
+          .slice(0, LLM_TOP_K);
+      }
+
       // Record-scoped queries: if user specifies a record id (e.g. "会议记录 002"),
       // always prefer chunks from that record first, so follow-up questions stay grounded.
       if (recordTokensStrict.length > 0) {
@@ -3819,6 +4245,32 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Research-summary + result/overview: build precise sources from the identified abstract section.
+    if (researchSectionBoundsDb && researchSectionNoteContent && recordHint == null) {
+      const { noteId, start, end } = researchSectionBoundsDb;
+      const sectionText = researchSectionNoteContent.slice(start, end);
+      const resultNeedle =
+        tailKeyphrase === "实验结果" || tailKeyphrase === "实验指标" || tailKeyphrase === "性能分析"
+          ? tailKeyphrase
+          : isResultOrExperimentQuestion(retrievalQuestion)
+            ? "实验结果"
+            : null;
+      const filename =
+        researchRows.find((r) => r.note_id === noteId)?.filename ??
+        baseSources.find((s) => s.noteId === noteId)?.filename ??
+        "research_summary";
+      const sub = resultNeedle ? extractResearchSubsectionByHeading(sectionText, start, resultNeedle) : null;
+      if (sub) {
+        focusedSources = [{ index: 1, noteId, filename, ...sub, similarity: 0.99 }];
+      } else if (
+        focusedSources.length === 0 ||
+        (researchTopicCore && focusedSources.every((s) => !includesTopicLoose(s.content, researchTopicCore)))
+      ) {
+        const picked = { content: sectionText.slice(0, 2000), startChar: start, endChar: Math.min(end, start + 2000) };
+        focusedSources = [{ index: 1, noteId, filename, ...picked, similarity: 0.99 }];
+      }
+    }
+
     // Record + subtopic strictness: if user asked about specific agenda subtopic(s),
     // only keep sources that truly contain the corresponding "## 议题N: <subtopic>" section.
     if (recordTokensStrict.length > 0) {
@@ -3846,6 +4298,28 @@ export async function POST(req: NextRequest) {
         hasAnswer: askedClarifyLastTurn ? false : true,
         rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
       });
+    }
+
+    // Guardrail for comparison/difference questions:
+    // If the question is explicitly comparing A vs B, require evidence mentioning BOTH sides.
+    // Otherwise the model may answer from general knowledge and cite unrelated chunks.
+    if (comparisonTopics && recordTokensStrict.length === 0) {
+      const { a, b } = comparisonTopics;
+      const hasA = focusedSources.some((s) => includesTopicLoose(s.content, a) || includesLoose(s.filename, a));
+      const hasB = focusedSources.some((s) => includesTopicLoose(s.content, b) || includesLoose(s.filename, b));
+      if (!(hasA && hasB)) {
+        const isClarifyMarker = (s: string) => s.includes("【需要补充上下文】");
+        const lastTurn = safeHistory.at(-1);
+        const askedClarifyLastTurn = Boolean(lastTurn?.answer && isClarifyMarker(lastTurn.answer));
+        const stage1 = `【需要补充上下文】\n我在当前笔记里暂时没检索到能直接对比“${a}”与“${b}”的内容。你可以补充一下：\n（1）这两个术语在你的笔记里是否有同义词/英文写法？\n或者\n（2）请直接贴出相关段落/关键词，或上传对应资料，我再基于新增资料检索与问答。`;
+        const stage2 = `我在当前已上传的笔记中仍然没有检索到能直接对比“${a}”与“${b}”的资料。\n如果你希望我继续回答，请上传/补充相关笔记（或把关键段落贴出来），我再基于新增资料进行检索与问答。`;
+        return NextResponse.json({
+          answer: askedClarifyLastTurn ? stage2 : stage1,
+          sources: [],
+          hasAnswer: askedClarifyLastTurn ? false : true,
+          rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+        });
+      }
     }
 
     // Re-index sources after any filtering so citations remain consistent.
@@ -3880,11 +4354,24 @@ export async function POST(req: NextRequest) {
         }
       }
 
+      if (researchSectionBoundsDb?.id && !isResultOrExperimentQuestion(retrievalQuestion)) {
+        const refined = refineRangeByResearchSummaryHeading(s.content, s.startChar, researchSectionBoundsDb.id, 1500);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
       if (isResultOrExperimentQuestion(retrievalQuestion)) {
         const resultNeedle =
           tailKeyphrase === "实验结果" || tailKeyphrase === "实验指标" || tailKeyphrase === "性能分析"
             ? tailKeyphrase
             : "实验结果";
+        if (researchSectionBoundsDb) {
+          const refinedSub = extractResearchSubsectionByHeading(s.content, s.startChar, resultNeedle);
+          if (refinedSub) {
+            return { ...s, content: refinedSub.content, startChar: refinedSub.startChar, endChar: refinedSub.endChar };
+          }
+        }
         const refined =
           refineRangeByNeedle(s.content, s.startChar, resultNeedle, 620) ??
           refineRangeByNeedle(s.content, s.startChar, "性能", 520) ??
@@ -3972,7 +4459,10 @@ export async function POST(req: NextRequest) {
       });
       return NextResponse.json({
         answer: stripMarkdownFormattingInAnswer(
-          normalizeAnswerCitationsToAvailableSources(result.answer, fallbackUiSources)
+          ensureAnswerHasAtLeastOneCitation(
+            normalizeAnswerCitationsToAvailableSources(result.answer, fallbackUiSources),
+            fallbackUiSources
+          )
         ),
         sources: fallbackUiSources,
         hasAnswer: result.hasAnswer,
@@ -4010,6 +4500,11 @@ export async function POST(req: NextRequest) {
                     refineRangeByNeedle(s.content, 0, "指标", 800);
                   return refined ? { ...s, content: refined.content } : s;
                 })
+              : researchSectionBoundsDb?.id
+                ? focusedSourcesReindexed.map((s) => {
+                    const refined = refineRangeByResearchSummaryHeading(s.content, 0, researchSectionBoundsDb.id, 1800);
+                    return refined ? { ...s, content: refined.content } : s;
+                  })
             : recordHint?.kind === "meeting" && recordHint.id
               ? focusedSourcesReindexed.map((s) => {
                   const refined = recordSubtopic
@@ -4025,6 +4520,7 @@ export async function POST(req: NextRequest) {
     const result = await askQuestion(question, llmSources, {
       focusTopic:
         topicHint ??
+        researchTopicCore ??
         (recordHint?.kind === "meeting" && recordHint.id && recordPrimarySubtopic
           ? recordPrimarySubtopic
           : undefined),
@@ -4172,6 +4668,7 @@ export async function POST(req: NextRequest) {
     }
 
     let normalizedAnswer = normalizeAnswerCitationsToAvailableSources(result.answer, uiSources);
+    normalizedAnswer = ensureAnswerHasAtLeastOneCitation(normalizedAnswer, uiSources);
 
     // If this is a "training strategy" query and the model answer missed the key details,
     // fall back to extracting the strongest evidence lines directly from sources.
