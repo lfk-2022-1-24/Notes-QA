@@ -824,6 +824,61 @@ function refineRangeByInclusionTopic(
   return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
 }
 
+function refineRangeByTrainingStrategyCue(
+  chunkContent: string,
+  chunkStartAbs: number,
+  maxLen = 520
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  if (!text.trim()) return null;
+  // Prefer an explicit "训练策略" heading, and clip to that section (heading + 1-2 lines)
+  // to avoid highlighting the entire surrounding chapter.
+  const lower = text.toLowerCase();
+  const headingCues = ["### 训练策略", "## 训练策略", "# 训练策略", "训练策略：", "训练策略:", "training strategy"];
+  let idx = -1;
+  for (const c of headingCues) {
+    const i = lower.indexOf(c.toLowerCase());
+    if (i >= 0 && (idx < 0 || i < idx)) idx = i;
+  }
+  if (idx < 0) return null;
+
+  // Find start of the heading line.
+  const lineStart = (() => {
+    const j = text.lastIndexOf("\n", idx);
+    return j >= 0 ? j + 1 : 0;
+  })();
+  const afterHeadingLine = (() => {
+    const j = text.indexOf("\n", idx);
+    return j >= 0 ? j + 1 : text.length;
+  })();
+
+  // Include the next 1-2 non-empty lines, stopping before the next heading.
+  const tail = text.slice(afterHeadingLine);
+  const lines = tail.split("\n");
+  let consumed = 0;
+  let included = 0;
+  for (const rawLine of lines) {
+    const l = rawLine.trimEnd();
+    consumed += rawLine.length + 1; // +1 for '\n'
+    if (!l.trim()) continue;
+    if (/^\s*#{1,6}\s+/.test(l)) break;
+    included++;
+    if (included >= 2) break;
+  }
+  const endIdx = Math.min(text.length, afterHeadingLine + consumed);
+  const mappedRange = mapNormRangeToOrig(map, lineStart, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
+  if (!snippet.trim()) return null;
+  // Hard cap as a safety.
+  const capped = snippet.length > maxLen ? snippet.slice(0, maxLen) : snippet;
+  const capEnd = mappedRange.start + capped.length;
+  return {
+    content: capped,
+    startChar: chunkStartAbs + mappedRange.start,
+    endChar: chunkStartAbs + capEnd,
+  };
+}
+
 function extractQuestionNumber(question: string): number | null {
   const q = question.trim();
   if (!q) return null;
@@ -1080,6 +1135,624 @@ function isOverviewQuestion(question: string): boolean {
   const q = question.trim();
   if (!q) return false;
   return /(讲解|解释|说明|介绍|概述|分析|总结|聊聊|说说|讲讲)\b/.test(q);
+}
+
+function isResultOrExperimentQuestion(question: string): boolean {
+  const q = (question || "").trim();
+  if (!q) return false;
+  return /(实验结果|实验|结果|指标|准确率|acc|f1|auc|loss|提升|下降|对比|消融|ablation|baseline|sota|效果|性能)/i.test(q);
+}
+
+function extractTailKeyphrase(question: string): string | null {
+  const q = (question || "").trim();
+  if (!q) return null;
+  // Keep this conservative: only keyphrases that strongly indicate the user intent.
+  if (q.includes("训练策略")) return "训练策略";
+  if (q.includes("优化策略")) return "优化策略";
+  return null;
+}
+
+function extractTrainingStrategyBoostTokens(question: string): string[] {
+  const q = (question || "").trim();
+  if (!q) return [];
+  const isTrainingStrategy =
+    q.includes("训练策略") ||
+    q.includes("训练方法") ||
+    q.includes("训练流程") ||
+    q.includes("训练设置") ||
+    q.toLowerCase().includes("training strategy") ||
+    q.toLowerCase().includes("optimizer") ||
+    q.toLowerCase().includes("learning rate") ||
+    q.toLowerCase().includes("scheduler");
+  if (!isTrainingStrategy) return [];
+
+  const tokens = [
+    "训练策略",
+    "训练方法",
+    "训练流程",
+    "训练设置",
+    "训练阶段",
+    "超参数",
+    "优化器",
+    "学习率",
+    "调度",
+    "余弦",
+    "退火",
+    "cosine",
+    "anneal",
+    "scheduler",
+    "learning rate",
+    "epoch",
+    "epochs",
+    "分布式",
+    "数据并行",
+    "并行",
+    "DDP",
+    "distributed",
+    "data parallel",
+  ];
+  return Array.from(new Set(tokens)).slice(0, 18);
+}
+
+function extractRecordIdHint(question: string): { kind: "meeting"; id: string } | null {
+  const q = (question || "").trim();
+  if (!q) return null;
+  const s = q
+    .replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xff10 + 0x30))
+    .replace(/\s+/g, " ");
+
+  const m =
+    // Note: avoid \b here because "002中" (digit + Han) isn't a word-boundary in JS regex.
+    s.match(/(?:会议记录|会议纪要|会议纪要记录)(?:\s*第)?\s*([0-9]{1,4})(?![0-9])/i) ||
+    s.match(/(?:^|[^0-9])([0-9]{1,4})\s*(?:号)?\s*(?:会议记录|会议纪要|会议纪要记录)/i);
+  if (!m) return null;
+  const raw = (m[1] || "").trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return null;
+  const id = String(n).padStart(3, "0");
+  return { kind: "meeting", id };
+}
+
+function buildMeetingRecordTokens(id: string): string[] {
+  const core = id.replace(/^0+/, "") || id;
+  const tokens = [
+    `会议记录 ${id}`,
+    `会议记录${id}`,
+    `会议记录 ${core}`,
+    `会议记录${core}`,
+    `会议纪要 ${id}`,
+    `会议纪要${id}`,
+    `会议纪要 ${core}`,
+    `会议纪要${core}`,
+    `纪要 ${id}`,
+    `纪要${id}`,
+    `第${id}`,
+    `第 ${id}`,
+  ];
+  return Array.from(new Set(tokens));
+}
+
+function buildMeetingRecordTokensStrict(id: string): string[] {
+  const core = id.replace(/^0+/, "") || id;
+  const tokens = [
+    `会议记录 ${id}`,
+    `会议记录${id}`,
+    `会议记录 ${core}`,
+    `会议记录${core}`,
+    `会议纪要 ${id}`,
+    `会议纪要${id}`,
+    `会议纪要 ${core}`,
+    `会议纪要${core}`,
+    `会议纪要记录 ${id}`,
+    `会议纪要记录${id}`,
+    `会议纪要记录 ${core}`,
+    `会议纪要记录${core}`,
+    `# 会议记录 ${id}`,
+    `# 会议记录${id}`,
+    `# 会议纪要 ${id}`,
+    `# 会议纪要${id}`,
+  ];
+  return Array.from(new Set(tokens));
+}
+
+function detectMeetingRecordHeadingId(content: string): string | null {
+  const text = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return null;
+  // Prefer markdown H1 headings.
+  const m1 = text.match(/^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*([0-9]{1,4})(?![0-9])/m);
+  if (m1 && m1[1]) {
+    const n = Number.parseInt(m1[1], 10);
+    if (Number.isFinite(n)) return String(n).padStart(3, "0");
+  }
+  // Fallback: allow "会议记录 002" anywhere, but this is weaker.
+  const m2 = text.match(/(?:会议记录|会议纪要|会议纪要记录)\s*0*([0-9]{1,4})(?![0-9])/);
+  if (m2 && m2[1]) {
+    const n = Number.parseInt(m2[1], 10);
+    if (Number.isFinite(n)) return String(n).padStart(3, "0");
+  }
+  return null;
+}
+
+function computeMeetingRecordSectionBoundsFromNoteContent(
+  noteContent: string,
+  recordId: string
+): { start: number; end: number } | null {
+  const raw = String(noteContent || "");
+  if (!raw) return null;
+  const idCore = (recordId || "").replace(/^0+/, "") || recordId;
+  if (!idCore) return null;
+  const re = new RegExp(
+    String.raw`^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*${escapeRegExp(idCore)}(?![0-9]).*$`,
+    "m"
+  );
+  const all: { idx: number }[] = [];
+  for (const m of raw.matchAll(new RegExp(re.source, "gm"))) {
+    if (m.index !== undefined) all.push({ idx: m.index });
+  }
+  if (all.length === 0) return null;
+  all.sort((a, b) => a.idx - b.idx);
+
+  // Find the first heading occurrence for this record id.
+  const target = all[0]!.idx;
+  // Find the next heading after target.
+  const nextRe = new RegExp(String.raw`^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*\d{1,4}(?![0-9]).*$`, "gm");
+  let end = raw.length;
+  for (const m of raw.matchAll(nextRe)) {
+    if (m.index !== undefined && m.index > target) {
+      end = m.index;
+      break;
+    }
+  }
+  return { start: target, end };
+}
+
+function computeMeetingRecordSectionBounds(
+  sources: SourceChunk[],
+  targetId: string
+): { start: number; end: number } | null {
+  const heads: { id: string; startChar: number }[] = [];
+  for (const s of sources) {
+    const id = detectMeetingRecordHeadingId(s.content);
+    if (!id) continue;
+    if (!Number.isFinite(s.startChar)) continue;
+    heads.push({ id, startChar: s.startChar });
+  }
+  if (heads.length === 0) return null;
+  heads.sort((a, b) => a.startChar - b.startChar);
+
+  const idx = heads.findIndex((h) => h.id === targetId);
+  if (idx < 0) return null;
+  const start = heads[idx]!.startChar;
+  const end = heads[idx + 1]?.startChar ?? Number.POSITIVE_INFINITY;
+  return { start, end };
+}
+
+function extractMeetingAgendaEvidenceLines(content: string, subtopic: string, maxLines = 10): string[] {
+  const t = (subtopic || "").trim();
+  if (!t) return [];
+  const text = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return [];
+  const re = new RegExp(String.raw`^\s*##\s*议题\s*\d+\s*[:：]\s*${escapeRegExp(t)}(?:\s|$).*`, "m");
+  const m = text.match(re);
+  if (!m || m.index === undefined) return [];
+  const startIdx = m.index;
+  const after = text.slice(startIdx + 1);
+  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
+  const endIdx = next >= 0 ? startIdx + 1 + next : text.length;
+  const section = text.slice(startIdx, endIdx);
+  const lines = section
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    // Drop the heading itself; keep content cues.
+    .filter((l) => !/^##\s*议题\s*\d+\s*[:：]/.test(l))
+    // Avoid checklist-style action items if they appear.
+    .filter((l) => !/^\[\s*[xX ]\s*\]\s+/.test(l) && !/^-\s*\[\s*[xX ]\s*\]\s+/.test(l));
+
+  // Prefer background/discussion/decision blocks if present.
+  const preferred: string[] = [];
+  for (const l of lines) {
+    if (/^(背景|讨论要点|决议)\s*[:：]/.test(stripMarkdownFormattingInAnswer(l))) {
+      preferred.push(stripMarkdownFormattingInAnswer(l));
+      continue;
+    }
+    // Keep bullet points that follow those sections.
+    if (/^[-*+]\s+/.test(l) || /^[•·]\s*/.test(l)) {
+      preferred.push(stripMarkdownFormattingInAnswer(l));
+      continue;
+    }
+    // Also keep a couple of plain sentences.
+    if (preferred.length < maxLines) preferred.push(stripMarkdownFormattingInAnswer(l));
+    if (preferred.length >= maxLines) break;
+  }
+  return preferred.slice(0, maxLines);
+}
+
+function extractMeetingRecordSubtopic(question: string, recordId: string): string | null {
+  const q = (question || "").trim();
+  if (!q) return null;
+  const id = recordId.replace(/^0+/, "") || recordId;
+  const re = new RegExp(
+    // Same: avoid \b; allow trailing Chinese like "002中".
+    String.raw`(?:会议记录|会议纪要|会议纪要记录)\s*(?:第)?\s*0*${id}(?![0-9])[\s\S]{0,30}?(?:中提到的|里提到的|中的|里|内的|内|提到的)\s*([^?？。！!]+)`,
+    "i"
+  );
+  const m = q.match(re);
+  if (m && m[1]) {
+    const t = String(m[1]).trim();
+    // Trim trailing generic ask words
+    const cleaned = t.replace(/(是什么|有哪些|主要|怎么|如何|讲解一下|解释一下|说明一下|详细说一下|说了什么|讲了什么)\s*$/g, "").trim();
+    if (!cleaned || cleaned.length < 2) return null;
+    if (/^(说了什么|讲了什么|什么|内容|情况)$/i.test(cleaned)) return null;
+    return cleaned.replace(/^(对于|关于|针对|就)\s*/g, "").replace(/^的\s*/g, "").trim();
+  }
+  // Also allow "...会议记录 002 的 <topic>" without "中提到的"
+  const reLoose = new RegExp(
+    String.raw`(?:会议记录|会议纪要|会议纪要记录)\s*(?:第)?\s*0*${id}(?![0-9])\s*的\s*([^?？。！!]+)`,
+    "i"
+  );
+  const mLoose = q.match(reLoose);
+  if (mLoose && mLoose[1]) {
+    const t = String(mLoose[1]).trim();
+    const cleaned = t
+      .replace(/^(详细|具体)?\s*(?:说一下|详细说一下|讲解一下|解释一下|说明一下|说说|讲讲)?\s*/g, "")
+      .replace(/(是什么|有哪些|主要|怎么|如何|讲解一下|解释一下|说明一下|详细说一下|说了什么|讲了什么)\s*$/g, "")
+      .replace(/^(对于|关于|针对|就)\s*/g, "")
+      .replace(/^的\s*/g, "")
+      .trim();
+    if (!cleaned || cleaned.length < 2) return null;
+    if (/^(说了什么|讲了什么|什么|内容|情况)$/i.test(cleaned)) return null;
+    return cleaned;
+  }
+  // Fallback: if question contains a quoted/explicit phrase, use it.
+  const m2 = q.match(/[“"「『](.+?)[”"」』]/);
+  if (m2 && m2[1]) {
+    const t = String(m2[1]).trim();
+    return t.length >= 2 ? t : null;
+  }
+  return null;
+}
+
+function extractMeetingRecordSubtopics(question: string, recordId: string): string[] {
+  const q = (question || "").trim();
+  if (!q) return [];
+  const id = recordId.replace(/^0+/, "") || recordId;
+  // Capture everything after "会议记录002 ..." and then split by common separators.
+  const re = new RegExp(
+    String.raw`(?:会议记录|会议纪要|会议纪要记录)\s*(?:第)?\s*0*${id}(?![0-9])[\s\S]{0,40}?(?:的)?\s*(?:中提到的|里提到的|中的|里|内的|内|提到的|关于)\s*([^?？。！!]+)`,
+    "i"
+  );
+  const m = q.match(re);
+  let tail = m?.[1] ? String(m[1]).trim() : "";
+  if (!tail) {
+    // If no "中提到的" cue, still allow "...会议记录 002 的 A，B" patterns.
+    const re2 = new RegExp(
+      String.raw`(?:详细|具体)?\s*(?:说一下|讲解一下|讲讲|说明一下)?\s*(?:会议记录|会议纪要|会议纪要记录)\s*(?:第)?\s*0*${id}(?![0-9])\s*(?:的)?\s*([^?？。！!]+)`,
+      "i"
+    );
+    const m2 = q.match(re2);
+    tail = m2?.[1] ? String(m2[1]).trim() : "";
+  }
+  if (!tail) return [];
+
+  // Remove generic ask words.
+  tail = tail
+    .replace(/^(详细|具体)\s*(?:说一下|讲解一下|讲讲|说明一下)?/g, "")
+    .replace(/(是什么|有哪些|主要|怎么|如何|讲解一下|解释一下|说明一下|详细说一下)\s*$/g, "")
+    .trim();
+  if (!tail) return [];
+
+  const parts = tail
+    .split(/[，,、;；\/\|]|(?:和|以及|及|还有|与)/g)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => s.replace(/^(关于|对于|针对|就|提到的|中提到的|里提到的)\s*/g, "").trim())
+    .map((s) => s.replace(/^的\s*/g, "").trim())
+    .filter((s) => s.length >= 2)
+    .filter((s) => !/^(说了什么|讲了什么|什么|内容|情况|等等|之类)$/i.test(s));
+
+  // Dedup, keep stable order.
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of parts) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out.slice(0, 4);
+}
+
+function extractMeetingAgendaSubtopicFromPattern(question: string): string | null {
+  const q = (question || "").trim();
+  if (!q) return null;
+  // Pattern: "对于X，会议记录002里说了什么" / "关于X，会议记录 002 ..."
+  const m = q.match(/^(?:对于|关于|针对|就)\s*([^，,。！？?？]{2,50})[，,]/);
+  if (!m || !m[1]) return null;
+  const t = String(m[1]).trim().replace(/^的\s*/g, "").trim();
+  if (!t || t.length < 2) return null;
+  if (/(会议记录|会议纪要|会议纪要记录)/.test(t)) return null;
+  if (/^(什么|内容|情况|说了什么|讲了什么)$/i.test(t)) return null;
+  return t;
+}
+
+function extractMeetingAgendaTitlesFromHeader(content: string): string[] {
+  const text = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return [];
+  const lines = text.split("\n");
+  const line =
+    lines.find((l) => /\b议题\b/.test(l) && /[:：]/.test(l)) ||
+    lines.find((l) => l.includes("议题") && (l.includes(":") || l.includes("："))) ||
+    "";
+  if (!line) return [];
+  const idx = line.indexOf(":") >= 0 ? line.indexOf(":") : line.indexOf("：");
+  if (idx < 0) return [];
+  const rhs = line.slice(idx + 1).trim();
+  if (!rhs) return [];
+  const parts = rhs
+    .split(/[;；]/g)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .flatMap((s) => s.split(/[，,、]/g).map((x) => x.trim()).filter(Boolean));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of parts) {
+    const t = p.replace(/^\*\*|^\-\s*/g, "").replace(/\*\*$/g, "").trim();
+    if (!t || t.length < 2) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out.slice(0, 10);
+}
+
+function refineRangeByNeedle(
+  chunkContent: string,
+  chunkStartAbs: number,
+  needle: string,
+  maxLen = 900
+): { content: string; startChar: number; endChar: number } | null {
+  const n = (needle || "").trim();
+  if (!n) return null;
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  if (!text.trim()) return null;
+  const idx = text.indexOf(n);
+  if (idx < 0) return null;
+  const bounds = getSentenceBounds(text, idx, { maxLen });
+  const mappedRange = mapNormRangeToOrig(map, bounds.startIdx, bounds.endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
+  if (!snippet.trim()) return null;
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + mappedRange.start,
+    endChar: chunkStartAbs + mappedRange.end,
+  };
+}
+
+function refineRangeByMeetingAgendaSubtopic(
+  chunkContent: string,
+  chunkStartAbs: number,
+  subtopic: string,
+  maxLen = 1300
+): { content: string; startChar: number; endChar: number } | null {
+  const t = (subtopic || "").trim();
+  if (!t) return null;
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  if (!text.trim()) return null;
+  // Prefer a markdown heading like "## 议题3: <t>" (tolerant to "**背景**" on same line).
+  const re = new RegExp(String.raw`^\s*##\s*议题\s*\d+\s*[:：]\s*${escapeRegExp(t)}(?:\s|$).*`, "m");
+  const m = text.match(re);
+  const idx = m && m.index !== undefined ? m.index : -1;
+  if (idx < 0) return null;
+
+  const startIdx = idx;
+  // End at next "## 议题" or "## 行动项汇总" or next H2 heading.
+  const after = text.slice(idx + 1);
+  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
+  const endIdx = next >= 0 ? Math.min(text.length, idx + 1 + next) : Math.min(text.length, startIdx + maxLen);
+
+  const mappedRange = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
+  if (!snippet.trim()) return null;
+  return {
+    content: snippet.length > maxLen ? snippet.slice(0, maxLen) : snippet,
+    startChar: chunkStartAbs + mappedRange.start,
+    endChar: chunkStartAbs + mappedRange.start + Math.min(snippet.length, maxLen),
+  };
+}
+
+function extractMeetingAgendaSubtopicCandidatesFromQuestion(question: string): string[] {
+  const q = (question || "").trim();
+  if (!q) return [];
+  // Split by separators, keep medium-length chunks as candidates.
+  const parts = q
+    .replace(/[?？!！。]/g, " ")
+    .split(/[，,、;；\/\|]|(?:和|以及|及|还有|与)/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const bad = new Set([
+    "会议记录",
+    "会议纪要",
+    "会议纪要记录",
+    "详细说一下",
+    "讲解一下",
+    "解释一下",
+    "说明一下",
+    "说一下",
+    "说了什么",
+    "讲了什么",
+    "对于",
+    "关于",
+    "中提到的",
+    "里提到的",
+    "提到的",
+    "主要包含",
+    "包含哪几部分",
+    "包含哪些部分",
+  ]);
+  const out: string[] = [];
+  for (const p of parts) {
+    const s = p
+      .replace(/^(详细|具体)?\s*(?:说一下|详细说一下|讲解一下|解释一下|说明一下|说说|讲讲)\s*/g, "")
+      .replace(/^(对于|关于|针对|就)\s*/g, "")
+      .replace(/^的\s*/g, "")
+      .trim();
+    if (!s || s.length < 2) continue;
+    if (bad.has(s)) continue;
+    // Drop record id mentions like "002"
+    if (/^\d{1,4}$/.test(s)) continue;
+    // Drop phrases that still contain the record name (likely the non-topic half).
+    if (/(会议记录|会议纪要|会议纪要记录)/.test(s)) continue;
+    // Avoid generic
+    if (/^(什么|内容|情况|等等)$/i.test(s)) continue;
+    out.push(s);
+  }
+  return Array.from(new Set(out)).slice(0, 4);
+}
+
+function isLikelyMeetingAgendaQuestion(question: string): boolean {
+  const q = (question || "").trim();
+  if (!q) return false;
+  // "对于X...会议记录002里说了什么" / "会议记录002里关于X" / etc.
+  return /(会议记录|会议纪要|会议纪要记录).*(说了什么|讲了什么|提到|关于|对于|详细说一下|讲解一下)/.test(q);
+}
+
+function refineRangeByMeetingRecordHeading(
+  chunkContent: string,
+  chunkStartAbs: number,
+  recordId: string,
+  maxLen = 900
+): { content: string; startChar: number; endChar: number } | null {
+  const { text, map } = buildLfTextAndMap(chunkContent);
+  if (!text.trim()) return null;
+  const tokens = buildMeetingRecordTokensStrict(recordId);
+  let idx = -1;
+  let matchedToken: string | null = null;
+  for (const t of tokens) {
+    const i = text.indexOf(t);
+    if (i >= 0 && (idx < 0 || i < idx)) {
+      idx = i;
+      matchedToken = t;
+    }
+  }
+  if (idx < 0) return null;
+
+  // Start at the heading line itself to avoid "preamble drift" like "准测试 ...".
+  const lineStart = (() => {
+    const j = text.lastIndexOf("\n", idx);
+    return j >= 0 ? j + 1 : 0;
+  })();
+
+  // End at next record heading within this chunk if present; otherwise keep a reasonable window.
+  const afterStart = text.slice(lineStart);
+  const nextRel = afterStart.slice(1).search(/^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*\d{1,4}(?!\d)/m);
+  const endIdx =
+    nextRel >= 0 ? Math.min(text.length, lineStart + 1 + nextRel) : Math.min(text.length, lineStart + maxLen);
+
+  const mappedRange = mapNormRangeToOrig(map, lineStart, endIdx, chunkContent.length);
+  const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
+  if (!snippet.trim()) return null;
+  return {
+    content: snippet,
+    startChar: chunkStartAbs + mappedRange.start,
+    endChar: chunkStartAbs + mappedRange.end,
+  };
+}
+
+function isMostlyMetaSnippet(s: string): boolean {
+  const t = (s || "").trim();
+  if (!t) return true;
+  // Only allow a small set of metadata lines; treat it as "meta-only" if it doesn't contain any result-ish cue.
+  const lines = t.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  if (lines.length === 0) return true;
+  const metaRe = /^[-*+]\s*(?:\*\*|__)?(日期|时间|天气|心情|标签|地点|作者)(?:\*\*|__)?\s*[:：]/;
+  const resultRe = /(实验结果|结果|指标|准确率|acc|f1|auc|loss|提升|下降|对比|ablation|消融|baseline|sota|显著|统计)/i;
+  const nonMeta = lines.filter((l) => !metaRe.test(l));
+  if (nonMeta.length === 0) return true;
+  return !resultRe.test(t);
+}
+
+function extractEvidenceLinesFromSource(content: string, needle: string, maxLines = 3): string[] {
+  const text = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return [];
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const isTraining = needle === "训练策略";
+  // Prefer a direct "训练策略" (or English) line; otherwise fall back to weaker cues.
+  const hitIdxNeedle = lines.findIndex((l) => l.includes(needle) || (isTraining && l.toLowerCase().includes("training strategy")));
+  const hitIdx =
+    hitIdxNeedle >= 0
+      ? hitIdxNeedle
+      : lines.findIndex((l) => {
+          if (isTraining) {
+            // Also accept common cues in training strategy sections (weaker than the title itself).
+            return (
+              (l.includes("训练") && l.includes("策略")) ||
+              l.toLowerCase().includes("training strategy") ||
+              l.includes("学习率") ||
+              l.includes("调度") ||
+              l.includes("余弦") ||
+              l.includes("退火") ||
+              /epoch/i.test(l) ||
+              l.includes("分布式") ||
+              l.includes("数据并行") ||
+              l.includes("DDP")
+            );
+          }
+          return false;
+        });
+  const start = hitIdx >= 0 ? hitIdx : 0;
+  const out: string[] = [];
+  for (let i = start; i < lines.length && out.length < maxLines; i++) {
+    const l = lines[i]!;
+    // Skip pure metadata
+    if (/^[-*+]\s*(?:\*\*|__)?(日期|时间|天气|心情|标签|地点|作者)(?:\*\*|__)?\s*[:：]/.test(l)) continue;
+    // For training-strategy extraction, stop before the next markdown section heading,
+    // so we don't accidentally include "评估与对比/下一节" headings.
+    if (isTraining && i > start && /^\s*#{1,6}\s+/.test(l)) break;
+    // Normalize markdown headings into plain text for answers.
+    if (isTraining && i === start && /^\s*#{1,6}\s+/.test(l)) {
+      out.push("训练策略：");
+      continue;
+    }
+    out.push(l);
+  }
+  return out;
+}
+
+function stripMarkdownFormattingInAnswer(answer: string): string {
+  if (!answer) return answer;
+  const lines = answer
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((l) => {
+      let s = l;
+      // Remove markdown headings at line start: "# foo" -> "foo"
+      s = s.replace(/^\s{0,3}#{1,6}\s+/, "");
+      // Remove simple list bullets: "- foo" -> "foo"
+      s = s.replace(/^\s*[-*+]\s+/, "");
+      // Remove bold/underline markers (keep text)
+      s = s.replace(/\*\*/g, "").replace(/__/g, "");
+      return s;
+    });
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function extractMeetingRecordIdFromHistory(history: HistoryTurn[]): string | null {
+  if (!Array.isArray(history) || history.length === 0) return null;
+  // Look at most recent turns first.
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (!h) continue;
+    const q = typeof h.question === "string" ? h.question : "";
+    const a = typeof h.answer === "string" ? h.answer : "";
+    const fromQ = extractRecordIdHint(q);
+    if (fromQ?.kind === "meeting") return fromQ.id;
+    const fromA = extractRecordIdHint(a);
+    if (fromA?.kind === "meeting") return fromA.id;
+  }
+  return null;
 }
 
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
@@ -1412,6 +2085,66 @@ function refineRangeByMarkdownLineMatch(
 
   let line = text.slice(startIdx, endIdx).trim();
 
+  const isMetaLine = (s: string) => {
+    const t = s.trim();
+    if (!t) return false;
+    // Common metadata lines in experiment logs / journals
+    return (
+      /^[-*+]\s*(?:\*\*|__)?(日期|时间|天气|心情|标签|地点|作者)(?:\*\*|__)?\s*[:：]/.test(t) ||
+      /^日期\s*[:：]/.test(t) ||
+      /^time\s*[:：]/i.test(t) ||
+      /^date\s*[:：]/i.test(t)
+    );
+  };
+
+  const looksLikeResultLine = (s: string) => {
+    const t = s.trim();
+    if (!t) return false;
+    return (
+      /(实验结果|结果|指标|准确率|acc|f1|auc|loss|提升|下降|对比|ablation|消融|baseline|sota|显著|统计)/i.test(t) ||
+      /(\d+(\.\d+)?\s*%)/.test(t)
+    );
+  };
+
+  const advanceFromMeta = (fromLineEndIdx: number) => {
+    let cursor = fromLineEndIdx;
+    for (let hops = 0; hops < 16 && cursor < text.length; hops++) {
+      cursor = cursor + 1;
+      if (cursor >= text.length) break;
+      const nextEnd = text.indexOf("\n", cursor);
+      const nextLineEnd = nextEnd >= 0 ? nextEnd : text.length;
+      const nextLineRaw = text.slice(cursor, nextLineEnd);
+      const nextLine = nextLineRaw.trim();
+      if (!nextLine) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      if (isMdNoiseLine(nextLine) || isMetaLine(nextLine)) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      if (isMdHeading(nextLine)) {
+        cursor = nextLineEnd;
+        continue;
+      }
+      // Prefer an explicit "result-like" line if present.
+      if (looksLikeResultLine(nextLine)) {
+        startIdx = cursor;
+        endIdx = nextLineEnd;
+        line = nextLine;
+        return;
+      }
+      // Otherwise, jump to the first non-meta content line.
+      if (hops >= 2) {
+        startIdx = cursor;
+        endIdx = nextLineEnd;
+        line = nextLine;
+        return;
+      }
+      cursor = nextLineEnd;
+    }
+  };
+
   // If we matched a heading/question line, highlight the next non-empty non-heading line as the "answer" line.
   if (isMdHeading(line) || looksLikeQuestionLine(line)) {
     let cursor = endIdx;
@@ -1440,6 +2173,12 @@ function refineRangeByMarkdownLineMatch(
       line = nextLine;
       break;
     }
+  }
+
+  // If we ended up on a metadata line (common when the match is a heading and the next line is "- **日期**: ..."),
+  // move down to a more meaningful line for highlighting (prefer result-like lines).
+  if (isMetaLine(line)) {
+    advanceFromMeta(endIdx);
   }
 
   // Cap highlight size hard.
@@ -1653,6 +2392,37 @@ export async function POST(req: NextRequest) {
     const inclusionTopic = extractInclusionTopic(retrievalQuestion);
     const topicHint = focus.topic ?? defTopic ?? inclusionTopic ?? undefined;
     const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
+    const tailKeyphrase = extractTailKeyphrase(retrievalQuestion);
+    const trainingBoostTokens = extractTrainingStrategyBoostTokens(retrievalQuestion);
+    // For record-scoped detection, prefer the ORIGINAL question: rewrites can reorder phrases
+    // and break "对于X，会议记录002..." style extraction.
+    const recordHintRaw = extractRecordIdHint(question) ?? extractRecordIdHint(retrievalQuestion);
+    const recordIdFromHistory = extractMeetingRecordIdFromHistory(safeHistory);
+    const recordHint: { kind: "meeting"; id: string } | null =
+      recordHintRaw ??
+      (recordIdFromHistory
+        ? {
+            kind: "meeting",
+            id: recordIdFromHistory,
+          }
+        : null);
+    const recordTokensLoose = recordHint?.kind === "meeting" ? buildMeetingRecordTokens(recordHint.id) : [];
+    const recordTokensStrict = recordHint?.kind === "meeting" ? buildMeetingRecordTokensStrict(recordHint.id) : [];
+    let recordSubtopic =
+      recordHint?.kind === "meeting" && recordHint.id ? extractMeetingRecordSubtopic(question, recordHint.id) : null;
+    let recordSubtopics =
+      recordHint?.kind === "meeting" && recordHint.id ? extractMeetingRecordSubtopics(question, recordHint.id) : [];
+    let recordPrimarySubtopic = recordSubtopic ?? recordSubtopics[0] ?? null;
+
+    // Special-case: "对于X，会议记录002里说了什么" should treat X as subtopic.
+    if (recordHint?.kind === "meeting" && recordHint.id) {
+      const t = extractMeetingAgendaSubtopicFromPattern(question);
+      if (t) {
+        recordSubtopics = Array.from(new Set([t, ...recordSubtopics])).slice(0, 4);
+        recordSubtopic = recordSubtopic ?? t;
+        recordPrimarySubtopic = recordPrimarySubtopic ?? t;
+      }
+    }
 
     // Embed the question
     const normalizedQuestion = normalizeForEmbedding(retrievalQuestion);
@@ -1859,11 +2629,192 @@ export async function POST(req: NextRequest) {
       }));
     }
 
+    // Training-strategy fallback: recall chunks that likely contain training strategy details.
+    let trainingRows: SearchRow[] = [];
+    if (trainingBoostTokens.length > 0) {
+      const likes = trainingBoostTokens.slice(0, 10).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(c.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+      const trainingResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE ${where}
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, ...likes]
+      );
+      trainingRows = trainingResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
+
+    // Meeting-record fallback: if the question names a specific record id (e.g. "会议记录 002"),
+    // recall chunks by matching the record id in content/filename.
+    let recordRows: SearchRow[] = [];
+    const recordNoteIds = new Set<string>();
+    const recordRowById = new Map<string, SearchRow>();
+    let recordTargetNoteId: string | null = null;
+    if (recordTokensStrict.length > 0) {
+      const likes = recordTokensStrict.slice(0, 10).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(c.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+      const recordResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE ${where}
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, ...likes]
+      );
+      recordRows = recordResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+      for (const r of recordRows) recordNoteIds.add(r.note_id);
+      for (const r of recordRows) recordRowById.set(r.id, r);
+      // Prefer the note that contains an actual "# 会议记录 <id>" heading.
+      if (recordHint?.kind === "meeting" && recordHint.id) {
+        const head = recordRows.find((r) => detectMeetingRecordHeadingId(r.content) === recordHint.id);
+        recordTargetNoteId = head?.note_id ?? null;
+      }
+    }
+
+    // If we have the noteId for record 002, compute exact section bounds using DB start_char ordering.
+    let meetingSectionBoundsDb: { noteId: string; start: number; end: number } | null = null;
+    if (recordHint?.kind === "meeting" && recordHint.id && recordNoteIds.size > 0) {
+      const noteId = recordTargetNoteId ?? Array.from(recordNoteIds)[0]!;
+      // Prefer note-level content bounds (more accurate than chunk boundaries when a chunk spans two records).
+      const noteRow = await query(`SELECT content FROM notes WHERE id = $1 LIMIT 1`, [noteId]);
+      const noteContent = String(noteRow.rows[0]?.content || "");
+      const bounds = computeMeetingRecordSectionBoundsFromNoteContent(noteContent, recordHint.id);
+      if (bounds) {
+        meetingSectionBoundsDb = { noteId, start: bounds.start, end: bounds.end };
+      }
+    }
+
+    // Direct agenda-section recall: when user asks about a specific agenda subtopic in a specific record,
+    // fetch the exact "## 议题N: <subtopic>" chunk inside that record section.
+    let recordAgendaRows: SearchRow[] = [];
+    if (
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      recordPrimarySubtopic &&
+      recordTargetNoteId &&
+      meetingSectionBoundsDb &&
+      Number.isFinite(meetingSectionBoundsDb.start)
+    ) {
+      const start = meetingSectionBoundsDb.start;
+      const end = Number.isFinite(meetingSectionBoundsDb.end) ? meetingSectionBoundsDb.end : 2147483647;
+      const like = `%${recordPrimarySubtopic}%`;
+      const agendaResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE c.note_id = $2
+          AND c.start_char >= $3
+          AND c.start_char < $4
+          AND c.content ILIKE '%## 议题%'
+          AND c.content ILIKE $5
+        ORDER BY c.start_char ASC
+        LIMIT $1`,
+        [KEYWORD_K, recordTargetNoteId, start, end, like]
+      );
+      const rows = agendaResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+      // Keep only rows that truly contain the agenda heading for this subtopic.
+      recordAgendaRows = rows.filter((r) => Boolean(refineRangeByMeetingAgendaSubtopic(r.content, 0, recordPrimarySubtopic, 280)));
+    }
+
+    // Record + subtopic boost: ensure we retrieve the agenda sections for requested topics (not just record header).
+    let recordSubtopicRows: SearchRow[] = [];
+    if (recordPrimarySubtopic && recordNoteIds.size > 0) {
+      const noteIds = Array.from(recordNoteIds).slice(0, 50);
+      const subLike = `%${recordPrimarySubtopic}%`;
+      const recordSubtopicResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE c.note_id = ANY($2::uuid[]) AND c.content ILIKE '%## 议题%' AND c.content ILIKE $3
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, noteIds, subLike]
+      );
+      recordSubtopicRows = recordSubtopicResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
+
+    // Multi-subtopic boost: for questions that mention multiple agenda topics, retrieve one chunk per topic.
+    let recordSubtopicsRows: SearchRow[] = [];
+    if (recordSubtopics.length > 0 && recordNoteIds.size > 0) {
+      const noteIds = Array.from(recordNoteIds).slice(0, 50);
+      const subs = recordSubtopics.slice(0, 4);
+      const likes = subs.map((t) => `%${t}%`);
+      const or = likes.map((_, i) => `c.content ILIKE $${i + 3}`).join(" OR ");
+      const result = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE c.note_id = ANY($2::uuid[]) AND c.content ILIKE '%## 议题%' AND (${or})
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, noteIds, ...likes]
+      );
+      recordSubtopicsRows = result.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
+
     // Merge exact match + keyword match
     const mergedKw = new Map<string, SearchRow>();
     for (const r of exactRows) mergedKw.set(r.id, r);
     for (const r of keywordRows) mergedKw.set(r.id, r);
     for (const r of dateRows) mergedKw.set(r.id, r);
+    for (const r of trainingRows) mergedKw.set(r.id, r);
+    for (const r of recordRows) mergedKw.set(r.id, r);
+    for (const r of recordSubtopicRows) mergedKw.set(r.id, r);
+    for (const r of recordSubtopicsRows) mergedKw.set(r.id, r);
+    for (const r of recordAgendaRows) mergedKw.set(r.id, r);
     keywordRows = Array.from(mergedKw.values());
 
     // Merge: prefer keyword hits first (higher recall), then fill with vector hits.
@@ -1879,6 +2830,21 @@ export async function POST(req: NextRequest) {
       if (defTopic && includesLoose(c, defTopic)) s += 4;
       if (defTopic && includesLoose(c, `${defTopic}是`)) s += 6;
       if (defTopic && (c.includes("目的") || c.includes("作用") || c.includes("用于"))) s += 2;
+      if (tailKeyphrase && includesLoose(c, tailKeyphrase)) s += 8;
+      if (recordTokensLoose.length > 0) {
+        for (const t of recordTokensLoose) {
+          if (includesLoose(c, t)) {
+            s += 10;
+            break;
+          }
+        }
+      }
+      if (trainingBoostTokens.length > 0) {
+        let hits = 0;
+        for (const t of trainingBoostTokens) if (includesLoose(c, t)) hits++;
+        if (hits >= 2) s += 6;
+        else if (hits >= 1) s += 3;
+      }
       if (qNoPunct && c.includes(qNoPunct)) s += 2;
       if (rawQ && c.includes(rawQ)) s += 2;
       if (qNoPunct && c.includes(`Q4: ${qNoPunct}`)) s += 6;
@@ -1886,19 +2852,44 @@ export async function POST(req: NextRequest) {
       return s;
     };
 
-    const relevantChunks = Array.from(merged.values())
+    let relevantChunks = Array.from(merged.values())
       .sort((a, b) => scoreExact(b.content) - scoreExact(a.content) || b.similarity - a.similarity)
       .slice(0, TOP_K);
+
+    // Tail-keyphrase guard: ensure we don't miss the core intent when the query has many qualifiers.
+    // Example: "基于对比学习的知识图谱性能分析的训练策略" should still retrieve chunks about "训练策略"
+    // even if they don't mention "知识图谱/性能分析".
+    if (tailKeyphrase) {
+      const must = Array.from(merged.values()).filter((r) => includesLoose(r.content, tailKeyphrase)).slice(0, TOP_K);
+      if (must.length > 0 && !relevantChunks.some((r) => includesLoose(r.content, tailKeyphrase))) {
+        const seen = new Set<string>();
+        const combined: SearchRow[] = [];
+        for (const r of must) {
+          if (seen.has(r.id)) continue;
+          seen.add(r.id);
+          combined.push(r);
+        }
+        for (const r of relevantChunks) {
+          if (seen.has(r.id)) continue;
+          seen.add(r.id);
+          combined.push(r);
+        }
+        relevantChunks = combined.slice(0, TOP_K);
+      }
+    }
 
     // Post-filter: keep only chunks that contain at least one strong query token.
     // This reduces "answer is correct but citations drift to unrelated blocks" (common for txt notes).
     const qTokens = extractMatchTokensFromQuestion(retrievalQuestion);
     const focusTokens = Array.from(
       new Set<string>([
+        ...(tailKeyphrase ? [tailKeyphrase] : []),
+        ...(trainingBoostTokens.slice(0, 2)),
+        ...(recordTokensLoose.slice(0, 2)),
         ...(topicHint ? topicTokenVariants(topicHint).slice(0, 2) : []),
         ...(focus.aspectWord ? [focus.aspectWord] : []),
       ])
-    ).slice(0, 3);
+    ).slice(0, 4);
 
     const strongTokens = (defTopic ? [defTopic, ...qTokens] : qTokens)
       .filter(Boolean)
@@ -1914,7 +2905,13 @@ export async function POST(req: NextRequest) {
 
     // For longer questions, require 2+ token hits to avoid "vaguely related" chunks.
     const minHits =
-      (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) && !defTopic && !topicHint ? 2 : 1;
+      (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) &&
+      !defTopic &&
+      !topicHint &&
+      !tailKeyphrase &&
+      recordTokensLoose.length === 0
+        ? 2
+        : 1;
 
     const filteredRelevant = relevantChunks.filter((r) => countTokenMatchesLoose(r.content, filterTokens) >= minHits);
     const relaxedRelevant = relevantChunks.filter((r) => anyTokenMatchLoose(r.content, filterTokens));
@@ -1951,22 +2948,141 @@ export async function POST(req: NextRequest) {
       };
     });
 
+    // If we detected a meeting record id, further restrict chunks to the section of that record within the same note
+    // (prevents mixing "参会人" blocks from other records inside the same file).
+    const meetingSectionNoteId =
+      meetingSectionBoundsDb?.noteId ?? recordTargetNoteId ?? (recordNoteIds.size > 0 ? Array.from(recordNoteIds)[0]! : null);
+    const meetingSectionBounds =
+      recordHint?.kind === "meeting" && recordHint.id && meetingSectionNoteId
+        ? computeMeetingRecordSectionBounds(baseSources.filter((s) => s.noteId === meetingSectionNoteId), recordHint.id)
+        : null;
+    const sectionScopedSources =
+      meetingSectionNoteId &&
+      ((meetingSectionBoundsDb && Number.isFinite(meetingSectionBoundsDb.start)) ||
+        (meetingSectionBounds && Number.isFinite(meetingSectionBounds.start)))
+        ? baseSources.filter((s) => {
+            if (s.noteId !== meetingSectionNoteId) return false;
+            if (!Number.isFinite(s.startChar)) return false;
+            if (meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId) {
+              return s.startChar >= meetingSectionBoundsDb.start && s.startChar < meetingSectionBoundsDb.end;
+            }
+            return s.startChar >= meetingSectionBounds!.start && s.startChar < meetingSectionBounds!.end;
+          })
+        : baseSources;
+
+    // If user did not use a recognizable "中提到的/的..." phrasing, try to infer subtopics directly
+    // from the record's agenda list in the header and any explicit mentions in the question.
+    if (recordHint?.kind === "meeting" && recordHint.id) {
+      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
+      if (agendaTitles.length > 0) {
+        const mentions = agendaTitles.filter((t) => includesLoose(retrievalQuestion, t));
+        if (mentions.length > 0) {
+          recordSubtopics = Array.from(new Set([...mentions, ...recordSubtopics])).slice(0, 4);
+          recordSubtopic = recordSubtopic ?? recordSubtopics[0] ?? null;
+          recordPrimarySubtopic = recordPrimarySubtopic ?? recordSubtopic;
+        }
+      }
+    }
+
+    // If still no subtopic extracted but the user mentions an agenda title-like phrase,
+    // try to align it to one of the agenda titles.
+    if (
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      recordSubtopics.length === 0 &&
+      recordSubtopic == null
+    ) {
+      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
+      const candidates = extractMeetingAgendaSubtopicCandidatesFromQuestion(retrievalQuestion);
+      if (agendaTitles.length > 0 && candidates.length > 0) {
+        const aligned: string[] = [];
+        for (const c of candidates) {
+          const hit = agendaTitles.find((t) => includesLoose(c, t) || includesLoose(t, c));
+          if (hit) aligned.push(hit);
+        }
+        if (aligned.length > 0) {
+          recordSubtopics = Array.from(new Set(aligned)).slice(0, 4);
+          recordSubtopic = recordSubtopics[0] ?? null;
+          recordPrimarySubtopic = recordSubtopic;
+        }
+      }
+    }
+
+    // Last-chance: for agenda questions like "对于X，会议记录002里说了什么？",
+    // treat any agenda title that appears anywhere in the question as a subtopic.
+    if (
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      recordSubtopics.length === 0 &&
+      recordSubtopic == null &&
+      isLikelyMeetingAgendaQuestion(retrievalQuestion)
+    ) {
+      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
+      if (agendaTitles.length > 0) {
+        const hits = agendaTitles.filter((t) => includesLoose(question, t) || includesLoose(retrievalQuestion, t));
+        if (hits.length > 0) {
+          recordSubtopics = hits.slice(0, 4);
+          recordSubtopic = recordSubtopics[0] ?? null;
+          recordPrimarySubtopic = recordSubtopic;
+        }
+      }
+    }
+
     // Pick LLM sources.
     // - If focus.topic exists, keep only those mentioning the topic.
     // - If the question is a definition ("X是什么"), prefer sources that mention X to avoid unrelated chunks.
     const focusedSources = (() => {
+      const sources = sectionScopedSources;
       // If the note contains the user's question as an almost-exact string (common in Q/A txt),
       // aggressively prefer that chunk to avoid citing adjacent template/metadata blocks.
-      const nearExact = baseSources.filter((s) => isNearDuplicateQuestion(s.content, retrievalQuestion));
+      const nearExact = sources.filter((s) => isNearDuplicateQuestion(s.content, retrievalQuestion));
       if (nearExact.length > 0) {
         return nearExact.slice(0, Math.min(LLM_TOP_K, 2));
+      }
+
+      // Record-scoped queries: if user specifies a record id (e.g. "会议记录 002"),
+      // always prefer chunks from that record first, so follow-up questions stay grounded.
+      if (recordTokensStrict.length > 0) {
+        const scoped =
+          recordNoteIds.size > 0
+            ? sources.filter((s) => recordNoteIds.has(s.noteId))
+            : sources.filter((s) => recordTokensStrict.some((t) => includesLoose(s.filename, t) || includesLoose(s.content, t)));
+        if (scoped.length > 0) {
+          const subtopics = recordSubtopics.length > 0 ? recordSubtopics : recordSubtopic ? [recordSubtopic] : [];
+          if (subtopics.length > 0) {
+            const picked: SourceChunk[] = [];
+            const seen = new Set<string>();
+            for (const t of subtopics) {
+              // Strongly prefer the exact agenda section "## 议题N: <t>".
+              const agendaCandidates = scoped.filter((s) => Boolean(refineRangeByMeetingAgendaSubtopic(s.content, 0, t, 280)));
+              const candidates = agendaCandidates
+                .slice()
+                // Prefer earlier section headings (closer to the actual agenda heading line).
+                .sort((a, b) => a.startChar - b.startChar);
+              for (const c of candidates) {
+                const key = `${c.noteId}:${c.startChar}:${c.endChar}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                picked.push(c);
+                break;
+              }
+            }
+            // When user explicitly asks about agenda subtopics, only keep the picked subtopic sections
+            // (and drop other chunks) to avoid irrelevant sources confusing the citations panel.
+            if (picked.length > 0) return picked.slice(0, LLM_TOP_K);
+          }
+          return scoped.slice(0, LLM_TOP_K);
+        }
       }
 
       // Date-scoped queries: ensure at least one chunk per note (md/pdf/txt) can be returned when it contains the date.
       if (dateHint) {
         const variants = pickYearfulDateVariants(dateHint, dateVariants.length > 0 ? dateVariants : [dateHint]);
         const perNote = new Map<string, SourceChunk>();
-        for (const s of baseSources) {
+        for (const s of sources) {
           const ok =
             variants.some((v) => includesDateLoose(s.filename, v) || includesDateLoose(s.content, v)) ||
             Boolean(refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 240));
@@ -1974,27 +3090,60 @@ export async function POST(req: NextRequest) {
           if (!perNote.has(s.noteId)) perNote.set(s.noteId, s);
         }
         const picked = Array.from(perNote.values());
-        return (picked.length > 0 ? picked : baseSources).slice(0, LLM_TOP_K);
+        return (picked.length > 0 ? picked : sources).slice(0, LLM_TOP_K);
+      }
+
+      // Tail keyphrase intent (e.g. "训练策略"): prioritize chunks that contain it.
+      if (tailKeyphrase) {
+        const rankTokens = filterTokens.length > 0 ? filterTokens : qTokens;
+        const arr = sources
+          .filter(
+            (s) =>
+              includesLoose(s.content, tailKeyphrase) ||
+              (s.content.includes("训练") && (s.content.includes("策略") || s.content.includes("方法") || s.content.includes("阶段")))
+          )
+          .sort(
+            (a, b) =>
+              countTokenMatchesLoose(b.content, rankTokens) - countTokenMatchesLoose(a.content, rankTokens) ||
+              b.similarity - a.similarity
+          )
+          .slice(0, LLM_TOP_K);
+        if (arr.length > 0) return arr;
       }
 
       if (topicHint) {
-        const arr = baseSources.filter((s) => includesTopicLoose(s.content, topicHint));
-        return (arr.length > 0 ? arr : baseSources).slice(0, LLM_TOP_K);
+        const arr = sources.filter((s) => includesTopicLoose(s.content, topicHint));
+        return (arr.length > 0 ? arr : sources).slice(0, LLM_TOP_K);
       }
 
       if (defTopic) {
-        const byTopic = baseSources.filter((s) => includesLoose(s.content, defTopic));
+        const byTopic = sources.filter((s) => includesLoose(s.content, defTopic));
         const byDefinition = byTopic.filter((s) => hasDefinitionCue(s.content, defTopic));
-        const picked = (byDefinition.length > 0 ? byDefinition : byTopic.length > 0 ? byTopic : baseSources).slice(
+        const picked = (byDefinition.length > 0 ? byDefinition : byTopic.length > 0 ? byTopic : sources).slice(
           0,
           LLM_TOP_K
         );
         return picked;
       }
 
+      // Experiment/result questions: avoid picking "meta-only" chunks like "- **日期**: ..."
+      if (isResultOrExperimentQuestion(retrievalQuestion)) {
+        const rankTokens = filterTokens.length > 0 ? filterTokens : qTokens;
+        const arr = sources
+          .filter((s) => countTokenMatchesLoose(s.content, rankTokens) >= 1)
+          .sort(
+            (a, b) =>
+              countTokenMatchesLoose(b.content, rankTokens) - countTokenMatchesLoose(a.content, rankTokens) ||
+              b.similarity - a.similarity
+          )
+          .filter((s) => !isMostlyMetaSnippet(s.content))
+          .slice(0, LLM_TOP_K);
+        if (arr.length > 0) return arr;
+      }
+
       // Default: prefer sources that match more query tokens.
       const rankTokens = filterTokens.length > 0 ? filterTokens : qTokens;
-      return baseSources
+      return sources
         .slice()
         .sort(
           (a, b) =>
@@ -2030,6 +3179,28 @@ export async function POST(req: NextRequest) {
 
       if (dateHint) {
         const refined = refineRangeByAnyLogDateHeading(s.content, s.startChar, dateHint, dateVariants, 1500);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
+      if (tailKeyphrase === "训练策略" || trainingBoostTokens.length > 0) {
+        const refined = refineRangeByTrainingStrategyCue(s.content, s.startChar, 620);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
+      if (recordHint?.kind === "meeting" && recordHint.id) {
+        if (recordSubtopic) {
+          const refined =
+            refineRangeByMeetingAgendaSubtopic(s.content, s.startChar, recordSubtopic, 1300) ??
+            refineRangeByNeedle(s.content, s.startChar, recordSubtopic, 900);
+          if (refined) {
+            return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+          }
+        }
+        const refined = refineRangeByMeetingRecordHeading(s.content, s.startChar, recordHint.id, 1100);
         if (refined) {
           return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
         }
@@ -2101,11 +3272,29 @@ export async function POST(req: NextRequest) {
               const refined = refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 1800);
               return refined ? { ...s, content: refined.content } : s;
             })
-        : focusedSources;
+          : tailKeyphrase === "训练策略" || trainingBoostTokens.length > 0
+            ? focusedSources.map((s) => {
+                const refined = refineRangeByTrainingStrategyCue(s.content, 0, 900);
+                return refined ? { ...s, content: refined.content } : s;
+              })
+            : recordHint?.kind === "meeting" && recordHint.id
+              ? focusedSources.map((s) => {
+                  const refined = recordSubtopic
+                    ? refineRangeByMeetingAgendaSubtopic(s.content, 0, recordSubtopic, 1400) ??
+                      refineRangeByNeedle(s.content, 0, recordSubtopic, 1200) ??
+                      refineRangeByMeetingRecordHeading(s.content, 0, recordHint.id, 1200)
+                    : refineRangeByMeetingRecordHeading(s.content, 0, recordHint.id, 1200);
+                  return refined ? { ...s, content: refined.content } : s;
+                })
+              : focusedSources;
 
     // Ask LLM with sources
     const result = await askQuestion(question, llmSources, {
-      focusTopic: topicHint,
+      focusTopic:
+        topicHint ??
+        (recordHint?.kind === "meeting" && recordHint.id && recordPrimarySubtopic
+          ? recordPrimarySubtopic
+          : undefined),
       focusAspect: focus.aspectWord,
     });
 
@@ -2117,9 +3306,82 @@ export async function POST(req: NextRequest) {
     // - 1st time: ask user to clarify instead of claiming "no info"
     // - 2nd time (after user follow-up): be explicit that notes don't contain relevant material
     if (!result.hasAnswer) {
+      // If the model refused due to "insufficient info" but sources contain the requested keyphrase,
+      // extract evidence lines directly from sources rather than asking for more context.
+      if (tailKeyphrase && uiSources.length > 0) {
+        const evidences = uiSources
+          .map((s) => ({ s, lines: extractEvidenceLinesFromSource(s.content, tailKeyphrase) }))
+          .filter((x) => x.lines.length > 0)
+          .slice(0, 3);
+        if (evidences.length > 0) {
+          const answer = [
+            `在你的笔记中，和“${tailKeyphrase}”相关的内容包括：`,
+            ...evidences.flatMap((x) => x.lines.map((l) => `${l} [${x.s.index}]`)),
+          ].join("\n");
+          return NextResponse.json({
+            answer,
+            sources: uiSources,
+            hasAnswer: true,
+            rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+          });
+        }
+      }
+
       const stage1 = `【需要补充上下文】\n我在当前笔记里暂时没检索到能直接回答你这个问题的内容。你可以补充一下：\n（1）你说的关键术语/对象具体指什么？（可以给全称、同义词、英文缩写）\n或者\n（2）如果你手头有相关段落/关键词，请直接贴出来或上传对应资料。`;
 
       const stage2 = `我在当前已上传的笔记中仍然没有检索到与该问题直接相关、可用于作答的资料。\n如果你希望我继续回答，请上传/补充相关笔记（或把关键段落贴出来），我再基于新增资料进行检索与问答。`;
+
+      // Record + subtopic fallback: if user asks about a specific meeting record and subtopic,
+      // but the model says "no info", extract evidence lines directly from scoped sources.
+      if (recordHint?.kind === "meeting" && recordHint.id && recordSubtopic) {
+        const scoped =
+          recordNoteIds.size > 0
+            ? baseSources.filter((s) => recordNoteIds.has(s.noteId))
+            : baseSources.filter((s) => recordTokensStrict.some((t) => includesLoose(s.filename, t) || includesLoose(s.content, t)));
+
+        const agendaEvidence = scoped
+          .map((s) => ({ s, lines: extractMeetingAgendaEvidenceLines(s.content, recordSubtopic, 10) }))
+          .filter((x) => x.lines.length > 0)
+          .slice(0, 1);
+        const genericEvidence = scoped
+          .map((s) => ({ s, lines: extractEvidenceLinesFromSource(s.content, recordSubtopic, 4) }))
+          .filter((x) => x.lines.length > 0)
+          .slice(0, 2);
+
+        const evidences = (agendaEvidence.length > 0 ? agendaEvidence : genericEvidence).slice(0, 3);
+        if (evidences.length > 0) {
+          // Put evidence sources first so citations map to visible blocks.
+          const evidenceSources = evidences.map((e) => e.s);
+          const pickedSources = [
+            ...evidenceSources,
+            ...scoped.filter((s) => !evidenceSources.some((e) => e.noteId === s.noteId && e.startChar === s.startChar && e.endChar === s.endChar)),
+          ].slice(0, LLM_TOP_K);
+          const sourcesForResp = pickedSources.map((s, i) => ({ ...s, index: i + 1 }));
+
+          // Build an index map for evidence sources (by noteId + range) to stable [n] citations.
+          const indexByKey = new Map<string, number>();
+          for (const s of sourcesForResp) {
+            indexByKey.set(`${s.noteId}:${s.startChar}:${s.endChar}`, s.index);
+          }
+
+          const answer = stripMarkdownFormattingInAnswer(
+            [
+              `在你的笔记中，“会议记录 ${recordHint.id}”里提到的“${recordSubtopic}”相关内容包括：`,
+              ...evidences.flatMap((x) => {
+                const key = `${x.s.noteId}:${x.s.startChar}:${x.s.endChar}`;
+                const idx = indexByKey.get(key) ?? 1;
+                return x.lines.map((l) => `${l} [${idx}]`);
+              }),
+            ].join("\n")
+          );
+          return NextResponse.json({
+            answer,
+            sources: sourcesForResp,
+            hasAnswer: true,
+            rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+          });
+        }
+      }
 
       return NextResponse.json({
         answer: askedClarifyLastTurn ? stage2 : stage1,
@@ -2131,10 +3393,32 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const normalizedAnswer = normalizeAnswerCitationsToAvailableSources(result.answer, uiSources);
+    let normalizedAnswer = normalizeAnswerCitationsToAvailableSources(result.answer, uiSources);
+
+    // If this is a "training strategy" query and the model answer missed the key details,
+    // fall back to extracting the strongest evidence lines directly from sources.
+    if ((tailKeyphrase === "训练策略" || trainingBoostTokens.length > 0) && uiSources.length > 0) {
+      const looksWeak =
+        !normalizedAnswer.includes("训练策略") &&
+        !normalizedAnswer.includes("学习率") &&
+        !normalizedAnswer.includes("余弦") &&
+        !/epoch/i.test(normalizedAnswer);
+      if (looksWeak) {
+        const evidences = uiSources
+          .map((s) => ({ s, lines: extractEvidenceLinesFromSource(s.content, "训练策略", 4) }))
+          .filter((x) => x.lines.length > 0)
+          .slice(0, 3);
+        if (evidences.length > 0) {
+          normalizedAnswer = [
+            `在你的笔记中，“训练策略”相关原文要点如下：`,
+            ...evidences.flatMap((x) => x.lines.map((l) => `${l} [${x.s.index}]`)),
+          ].join("\n");
+        }
+      }
+    }
 
     return NextResponse.json({
-      answer: normalizedAnswer,
+      answer: stripMarkdownFormattingInAnswer(normalizedAnswer),
       sources: uiSources,
       hasAnswer: result.hasAnswer,
       rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
