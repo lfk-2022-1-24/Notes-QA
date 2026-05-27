@@ -2962,11 +2962,17 @@ export async function POST(req: NextRequest) {
         (meetingSectionBounds && Number.isFinite(meetingSectionBounds.start)))
         ? baseSources.filter((s) => {
             if (s.noteId !== meetingSectionNoteId) return false;
-            if (!Number.isFinite(s.startChar)) return false;
-            if (meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId) {
-              return s.startChar >= meetingSectionBoundsDb.start && s.startChar < meetingSectionBoundsDb.end;
-            }
-            return s.startChar >= meetingSectionBounds!.start && s.startChar < meetingSectionBounds!.end;
+            if (!Number.isFinite(s.startChar) || !Number.isFinite(s.endChar)) return false;
+            const start =
+              meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId
+                ? meetingSectionBoundsDb.start
+                : meetingSectionBounds!.start;
+            const end =
+              meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId
+                ? meetingSectionBoundsDb.end
+                : meetingSectionBounds!.end;
+            // Keep any chunk that overlaps the section, not only those whose start is inside.
+            return s.endChar > start && s.startChar < end;
           })
         : baseSources;
 
@@ -3074,6 +3080,25 @@ export async function POST(req: NextRequest) {
             // (and drop other chunks) to avoid irrelevant sources confusing the citations panel.
             if (picked.length > 0) return picked.slice(0, LLM_TOP_K);
           }
+          // For record overview queries (no specific subtopic), always include the record header chunk
+          // so the model can ground basic info + agenda list.
+          if (recordHint?.kind === "meeting" && recordHint.id) {
+            const header = scoped.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+            if (header) {
+              const rest = scoped.filter((s) => s !== header);
+              const rankTokens = filterTokens.length > 0 ? filterTokens : qTokens;
+              const picked = [header, ...rest]
+                .slice()
+                .sort(
+                  (a, b) =>
+                    (a === header ? -1 : b === header ? 1 : 0) ||
+                    countTokenMatchesLoose(b.content, rankTokens) - countTokenMatchesLoose(a.content, rankTokens) ||
+                    b.similarity - a.similarity
+                )
+                .slice(0, LLM_TOP_K);
+              return picked;
+            }
+          }
           return scoped.slice(0, LLM_TOP_K);
         }
       }
@@ -3155,7 +3180,7 @@ export async function POST(req: NextRequest) {
 
     // Guardrail: if the user asks about a clear topic ("X是什么"/"X包括什么"/focus patterns),
     // but we failed to retrieve any chunk mentioning that topic, don't answer with unrelated citations.
-    if (topicHint && !focusedSources.some((s) => includesTopicLoose(s.content, topicHint))) {
+    if (topicHint && recordTokensStrict.length === 0 && !focusedSources.some((s) => includesTopicLoose(s.content, topicHint))) {
       // Let the downstream no-answer flow produce the two-stage clarification UX.
       const isClarifyMarker = (s: string) => s.includes("【需要补充上下文】");
       const lastTurn = safeHistory.at(-1);
