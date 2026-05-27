@@ -1,23 +1,32 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 
 interface UploadZoneProps {
   onUploadComplete: () => void;
 }
 
+type UploadResult = {
+  status: "success" | "error";
+  summary: string;
+  messages: string[];
+};
+
 export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState<string[]>([]);
+  const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
+  const lastFilesRef = useRef<File[]>([]);
 
   const uploadFiles = useCallback(
     async (files: FileList | File[]) => {
       setIsUploading(true);
-      setUploadStatus([]);
+      setUploadResult(null);
 
       const formData = new FormData();
-      for (const file of files) {
+      const fileArray = Array.from(files);
+      lastFilesRef.current = fileArray;
+      for (const file of fileArray) {
         formData.append("files", file);
       }
 
@@ -29,17 +38,35 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
         const data = await res.json();
 
         const statuses: string[] = [];
+        let okCount = 0;
+        let errorCount = 0;
         for (const r of data.results) {
           if (r.error) {
+            errorCount += 1;
             statuses.push(`❌ ${r.filename}: ${r.error}`);
           } else {
+            okCount += 1;
             statuses.push(`✓ ${r.filename} (${r.chunkCount} chunks)`);
           }
         }
-        setUploadStatus(statuses);
-        onUploadComplete();
+        const status: UploadResult = {
+          status: errorCount > 0 ? "error" : "success",
+          summary:
+            errorCount > 0
+              ? `导入完成：成功 ${okCount} 个，失败 ${errorCount} 个。`
+              : `导入成功：共 ${okCount} 个文件。`,
+          messages: statuses,
+        };
+        setUploadResult(status);
+        if (okCount > 0) {
+          onUploadComplete();
+        }
       } catch (err) {
-        setUploadStatus(["Upload failed: " + (err instanceof Error ? err.message : "Unknown error")]);
+        setUploadResult({
+          status: "error",
+          summary: "导入失败：请求未完成。",
+          messages: ["错误原因: " + (err instanceof Error ? err.message : "Unknown error")],
+        });
       } finally {
         setIsUploading(false);
       }
@@ -110,13 +137,42 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
           </div>
         )}
       </div>
-      {uploadStatus.length > 0 && (
-        <div className="mt-2 text-sm space-y-1">
-          {uploadStatus.map((status, i) => (
-            <div key={i} className={status.startsWith("❌") ? "text-red-500" : "text-green-600"}>
-              {status}
-            </div>
-          ))}
+      {uploadResult && (
+        <div
+          className={`mt-3 rounded-lg border px-3 py-2 text-sm ${
+            uploadResult.status === "success"
+              ? "border-green-200 bg-green-50 text-green-700"
+              : "border-red-200 bg-red-50 text-red-700"
+          }`}
+        >
+          <div className="font-medium">{uploadResult.summary}</div>
+          <div className="mt-1 space-y-1">
+            {uploadResult.messages.map((status, i) => (
+              <div key={i}>{status}</div>
+            ))}
+          </div>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => setUploadResult(null)}
+              className={`px-2.5 py-1 rounded text-xs font-medium ${
+                uploadResult.status === "success"
+                  ? "bg-green-600 text-white hover:bg-green-700"
+                  : "bg-red-600 text-white hover:bg-red-700"
+              }`}
+            >
+              确认
+            </button>
+            {uploadResult.status === "error" && lastFilesRef.current.length > 0 && (
+              <button
+                type="button"
+                onClick={() => uploadFiles(lastFilesRef.current)}
+                className="px-2.5 py-1 rounded text-xs font-medium border border-red-200 text-red-700 bg-white hover:bg-red-50"
+              >
+                重试
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

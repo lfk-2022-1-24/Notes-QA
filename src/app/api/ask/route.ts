@@ -487,6 +487,29 @@ function trimLeadingToBoldHeading(
   return { snippet: out, delta: pickIdx };
 }
 
+function findBoldHeadingIndex(text: string, token?: string): number | null {
+  if (!text || !token) return null;
+  let best: number | null = null;
+  for (const m of text.matchAll(/\*\*([^*\n]{1,120})\*\*/g)) {
+    if (m.index === undefined) continue;
+    const title = (m[1] || "").trim();
+    if (!title) continue;
+    if (includesLoose(title, token)) {
+      best = m.index;
+      break;
+    }
+  }
+  return best;
+}
+
+function pickHighlightTrimToken(question: string, tokens: string[]): string | undefined {
+  const focus = extractFocus(question);
+  if (focus?.aspectWord) return focus.aspectWord;
+  const tailKeyphrase = extractTailKeyphrase(question);
+  if (tailKeyphrase) return tailKeyphrase;
+  return tokens.find((t) => t.length >= 2) || tokens[0];
+}
+
 function trimLeadingToMarkdownHeading(
   snippet: string,
   preferredToken?: string
@@ -2231,8 +2254,11 @@ function refineRangeByMarkdownLineMatch(
   const { text, map } = buildLfTextAndMap(chunkContent);
   const tokens0 = extractMatchTokensFromQuestion(question);
   const tokens = filterTokensByRarityInText(text, tokens0);
-  if (tokens.length === 0) return null;
-  const matchIdx = findBestKeywordMatchIndex(text, tokens);
+  const trimToken = pickHighlightTrimToken(question, tokens0);
+  let matchIdx = tokens.length > 0 ? findBestKeywordMatchIndex(text, tokens) : null;
+  if (matchIdx === null && trimToken) {
+    matchIdx = findBoldHeadingIndex(text, trimToken);
+  }
   if (matchIdx === null) return null;
 
   const isMdHeading = (s: string) => /^\s*#{1,6}\s+\S+/.test(s.trim());
@@ -2244,6 +2270,7 @@ function refineRangeByMarkdownLineMatch(
 
   const overview = isOverviewQuestion(question);
   const mainToken = tokens.find((t) => t.length >= 2) || tokens[0];
+  const preferredTrimToken = trimToken ?? mainToken;
 
   // Overview mode: if we can find a heading containing the main token near the match,
   // return a section slice (not just a single line).
@@ -2453,14 +2480,14 @@ function refineRangeByMarkdownLineMatch(
   let snippet = chunkContent.slice(mapped.start, mapped.end);
   // If the line was flattened and includes prior numbered items, prefer starting from the first bold heading.
   {
-    const trimmed = trimLeadingToBoldHeading(snippet, mainToken);
+    const trimmed = trimLeadingToBoldHeading(snippet, preferredTrimToken);
     if (trimmed.delta > 0) {
       snippet = trimmed.snippet;
       mapped.start = mapped.start + trimmed.delta;
     }
   }
   {
-    const trimmed = trimLeadingToMarkdownHeading(snippet, mainToken);
+    const trimmed = trimLeadingToMarkdownHeading(snippet, preferredTrimToken);
     if (trimmed.delta > 0) {
       snippet = trimmed.snippet;
       mapped.start = mapped.start + trimmed.delta;
@@ -2580,13 +2607,13 @@ function refineRangeByQuestionMatch(
   const mapped = mapNormRangeToOrig(map, tightStart, tightEnd, chunkContent.length);
   let snippet = chunkContent.slice(mapped.start, mapped.end);
   {
-    const mainToken = tokens.find((t) => t.length >= 2) || tokens[0];
-    const trimmed = trimLeadingToBoldHeading(snippet, mainToken);
+    const trimToken = pickHighlightTrimToken(question, tokens);
+    const trimmed = trimLeadingToBoldHeading(snippet, trimToken);
     if (trimmed.delta > 0) {
       snippet = trimmed.snippet;
       mapped.start = mapped.start + trimmed.delta;
     }
-    const headingTrimmed = trimLeadingToMarkdownHeading(snippet, mainToken);
+    const headingTrimmed = trimLeadingToMarkdownHeading(snippet, trimToken);
     if (headingTrimmed.delta > 0) {
       snippet = headingTrimmed.snippet;
       mapped.start = mapped.start + headingTrimmed.delta;
