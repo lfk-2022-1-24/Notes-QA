@@ -23,7 +23,8 @@ async function callMultimodalEmbedding(text: string): Promise<number[]> {
   });
 
   let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // More retries + backoff to reduce "first request fails, second succeeds".
+  for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const res = await fetchWithTimeout(
         url,
@@ -45,8 +46,9 @@ async function callMultimodalEmbedding(text: string): Promise<number[]> {
       return json.data.embedding;
     } catch (err) {
       lastErr = err;
-      // small backoff for transient network resets
-      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+      // small exponential backoff for transient network resets
+      const jitter = Math.floor(Math.random() * 60);
+      await new Promise((r) => setTimeout(r, 180 * (attempt + 1) * (attempt + 1) + jitter));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error("Embedding request failed");

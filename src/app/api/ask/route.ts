@@ -1234,23 +1234,71 @@ function buildMeetingRecordTokens(id: string): string[] {
 
 function buildMeetingRecordTokensStrict(id: string): string[] {
   const core = id.replace(/^0+/, "") || id;
+  const fullwidthId = id.replace(/[0-9]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0x30 + 0xff10));
+  const fullwidthCore = core.replace(/[0-9]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0x30 + 0xff10));
   const tokens = [
     `会议记录 ${id}`,
     `会议记录${id}`,
     `会议记录 ${core}`,
     `会议记录${core}`,
+    `会议记录 ${fullwidthId}`,
+    `会议记录${fullwidthId}`,
+    `会议记录 ${fullwidthCore}`,
+    `会议记录${fullwidthCore}`,
+    `会议记录-${id}`,
+    `会议记录-${core}`,
+    `会议记录—${id}`,
+    `会议记录—${core}`,
+    `会议记录_${id}`,
+    `会议记录_${core}`,
+    `会议记录（${id}）`,
+    `会议记录(${id})`,
+    `会议记录（${core}）`,
+    `会议记录(${core})`,
+    `会议记录（${fullwidthId}）`,
+    `会议记录(${fullwidthId})`,
+    `会议记录（${fullwidthCore}）`,
+    `会议记录(${fullwidthCore})`,
     `会议纪要 ${id}`,
     `会议纪要${id}`,
     `会议纪要 ${core}`,
     `会议纪要${core}`,
+    `会议纪要 ${fullwidthId}`,
+    `会议纪要${fullwidthId}`,
+    `会议纪要 ${fullwidthCore}`,
+    `会议纪要${fullwidthCore}`,
+    `会议纪要-${id}`,
+    `会议纪要-${core}`,
+    `会议纪要—${id}`,
+    `会议纪要—${core}`,
     `会议纪要记录 ${id}`,
     `会议纪要记录${id}`,
     `会议纪要记录 ${core}`,
     `会议纪要记录${core}`,
+    `会议纪要记录 ${fullwidthId}`,
+    `会议纪要记录${fullwidthId}`,
+    `会议纪要记录 ${fullwidthCore}`,
+    `会议纪要记录${fullwidthCore}`,
+    `会议纪要记录-${id}`,
+    `会议纪要记录-${core}`,
+    `会议纪要记录—${id}`,
+    `会议纪要记录—${core}`,
     `# 会议记录 ${id}`,
     `# 会议记录${id}`,
     `# 会议纪要 ${id}`,
     `# 会议纪要${id}`,
+    `## 会议记录 ${id}`,
+    `## 会议记录${id}`,
+    `## 会议纪要 ${id}`,
+    `## 会议纪要${id}`,
+    `# 会议记录 ${fullwidthId}`,
+    `# 会议记录${fullwidthId}`,
+    `# 会议纪要 ${fullwidthId}`,
+    `# 会议纪要${fullwidthId}`,
+    `## 会议记录 ${fullwidthId}`,
+    `## 会议记录${fullwidthId}`,
+    `## 会议纪要 ${fullwidthId}`,
+    `## 会议纪要${fullwidthId}`,
   ];
   return Array.from(new Set(tokens));
 }
@@ -1281,8 +1329,9 @@ function computeMeetingRecordSectionBoundsFromNoteContent(
   if (!raw) return null;
   const idCore = (recordId || "").replace(/^0+/, "") || recordId;
   if (!idCore) return null;
+  // Accept both markdown headings ("## 会议记录 003") and plain-text headings ("会议记录 003").
   const re = new RegExp(
-    String.raw`^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*${escapeRegExp(idCore)}(?![0-9]).*$`,
+    String.raw`^\s*(?:#{1,6}\s*)?(?:会议记录|会议纪要|会议纪要记录)\s*0*${escapeRegExp(idCore)}(?![0-9]).*$`,
     "m"
   );
   const all: { idx: number }[] = [];
@@ -1295,7 +1344,10 @@ function computeMeetingRecordSectionBoundsFromNoteContent(
   // Find the first heading occurrence for this record id.
   const target = all[0]!.idx;
   // Find the next heading after target.
-  const nextRe = new RegExp(String.raw`^\s*#\s*(?:会议记录|会议纪要|会议纪要记录)\s*0*\d{1,4}(?![0-9]).*$`, "gm");
+  const nextRe = new RegExp(
+    String.raw`^\s*(?:#{1,6}\s*)?(?:会议记录|会议纪要|会议纪要记录)\s*0*\d{1,4}(?![0-9]).*$`,
+    "gm"
+  );
   let end = raw.length;
   for (const m of raw.matchAll(nextRe)) {
     if (m.index !== undefined && m.index > target) {
@@ -1322,6 +1374,8 @@ function clipChunkToSection(
   const relEnd = Math.max(relStart, endAbs - chunkStartAbs);
   const sliced = String(chunkContent || "").slice(relStart, relEnd);
   if (!sliced.trim()) return null;
+  // Avoid creating meaningless one-character snippets like "-" after clipping.
+  if (sliced.trim().length < 3) return null;
   return { content: sliced, startChar: startAbs, endChar: endAbs };
 }
 
@@ -1841,6 +1895,18 @@ function extractMeetingRecordIdFromHistory(history: HistoryTurn[]): string | nul
     if (fromA?.kind === "meeting") return fromA.id;
   }
   return null;
+}
+
+function isLikelyRecordFollowupQuestion(question: string): boolean {
+  const q = (question || "").trim();
+  if (!q) return false;
+  // If the current question already names a record id, it's not "history-based".
+  if (extractRecordIdHint(q)?.kind === "meeting") return false;
+  // Pronoun/follow-up cues.
+  if (/(它|他|她|其|这个|那个|上述|前面|上一个|该|此|这里|里面|其中|这次|上次|刚刚|之前)/.test(q)) return true;
+  // Explicit meeting-record context words without id.
+  if (/(会议记录|会议纪要|会议|议题|参会人|主持人|行动项|决议)/.test(q)) return true;
+  return false;
 }
 
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
@@ -2485,7 +2551,12 @@ export async function POST(req: NextRequest) {
     // For record-scoped detection, prefer the ORIGINAL question: rewrites can reorder phrases
     // and break "对于X，会议记录002..." style extraction.
     const recordHintRaw = extractRecordIdHint(question) ?? extractRecordIdHint(retrievalQuestion);
-    const recordIdFromHistory = extractMeetingRecordIdFromHistory(safeHistory);
+    // Only inherit record id from the *immediately previous turn*.
+    // This prevents unrelated follow-ups like "反射的优点" -> "它的缺点" from accidentally inheriting
+    // an older meeting record id (e.g. "会议记录 025") from earlier in the conversation.
+    const recordIdFromHistory = isLikelyRecordFollowupQuestion(question)
+      ? extractMeetingRecordIdFromHistory(safeHistory.slice(-1))
+      : null;
     const recordHint: { kind: "meeting"; id: string } | null =
       recordHintRaw ??
       (recordIdFromHistory
@@ -2796,6 +2867,34 @@ export async function POST(req: NextRequest) {
         meetingSectionBoundsDb = { noteId, start: bounds.start, end: bounds.end };
       }
     }
+    // If chunk-level record recall didn't return any rows (or couldn't identify the target note),
+    // fall back to locating the note directly from notes.content/filename.
+    if (recordHint?.kind === "meeting" && recordHint.id && meetingSectionBoundsDb == null) {
+      const likes = buildMeetingRecordTokensStrict(recordHint.id).slice(0, 12).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(n.content ILIKE $${i + 1} OR n.filename ILIKE $${i + 1})`).join(" OR ");
+      const noteRes = await query(
+        `SELECT id, filename, content
+         FROM notes n
+         WHERE ${where}
+         ORDER BY n.id
+         LIMIT 2`,
+        likes
+      );
+      const row = noteRes.rows[0];
+      if (row) {
+        const noteId = String(row.id || "");
+        const noteContent = String(row.content || "");
+        if (noteId && noteContent.trim()) {
+          meetingSectionNoteContent = noteContent;
+          const bounds = computeMeetingRecordSectionBoundsFromNoteContent(noteContent, recordHint.id);
+          if (bounds) {
+            meetingSectionBoundsDb = { noteId, start: bounds.start, end: bounds.end };
+            recordNoteIds.add(noteId);
+            recordTargetNoteId = recordTargetNoteId ?? noteId;
+          }
+        }
+      }
+    }
 
     // Direct agenda-section recall: when user asks about a specific agenda subtopic in a specific record,
     // fetch the exact "## 议题N: <subtopic>" chunk inside that record section.
@@ -2946,6 +3045,16 @@ export async function POST(req: NextRequest) {
       .sort((a, b) => scoreExact(b.content) - scoreExact(a.content) || b.similarity - a.similarity)
       .slice(0, TOP_K);
 
+    // Record-id guard: if user asked for a specific meeting record, ensure the record header chunk
+    // ("# 会议记录 013") is included when present. This stabilizes recall when keywordRows happen
+    // to miss the header but still hit other parts of the file.
+    if (recordHint?.kind === "meeting" && recordHint.id && recordRows.length > 0) {
+      const header = recordRows.find((r) => detectMeetingRecordHeadingId(r.content) === recordHint.id);
+      if (header && !relevantChunks.some((r) => r.id === header.id)) {
+        relevantChunks = [header, ...relevantChunks].slice(0, TOP_K);
+      }
+    }
+
     // Tail-keyphrase guard: ensure we don't miss the core intent when the query has many qualifiers.
     // Example: "基于对比学习的知识图谱性能分析的训练策略" should still retrieve chunks about "训练策略"
     // even if they don't mention "知识图谱/性能分析".
@@ -2994,12 +3103,14 @@ export async function POST(req: NextRequest) {
     ).slice(0, 12);
 
     // For longer questions, require 2+ token hits to avoid "vaguely related" chunks.
+    // When embeddings are unavailable (vectorStr == null), be more permissive to reduce false "no results".
     const minHits =
       (filterTokens.length >= 4 || retrievalQuestion.trim().length >= 12) &&
       !defTopic &&
       !topicHint &&
       !tailKeyphrase &&
-      recordTokensLoose.length === 0
+      recordTokensLoose.length === 0 &&
+      vectorStr != null
         ? 2
         : 1;
 
@@ -3013,8 +3124,99 @@ export async function POST(req: NextRequest) {
           ? relaxedRelevant
           : relevantChunks;
 
+    // Internal automatic second retrieval (looser):
+    // If we have a strong constraint (meeting record id) but ended up with no chunks,
+    // fall back to slicing the raw note content directly. This avoids "first miss, second hit"
+    // caused by embedding outages or chunking gaps.
+    if (
+      finalRelevantChunks.length === 0 &&
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      recordTokensStrict.length > 0
+    ) {
+      // Try to locate the note content by searching the notes table (content/filename).
+      // We keep this query small and only use it when we already failed to retrieve any chunks.
+      const likes = buildMeetingRecordTokensStrict(recordHint.id).slice(0, 10).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(n.content ILIKE $${i + 1} OR n.filename ILIKE $${i + 1})`).join(" OR ");
+      const noteRes = await query(
+        `SELECT id, filename, content
+         FROM notes n
+         WHERE ${where}
+         ORDER BY n.id
+         LIMIT 3`,
+        likes
+      );
+      for (const row of noteRes.rows) {
+        const noteId = String(row.id || "");
+        const filename = String(row.filename || "meeting_record");
+        const content = String(row.content || "");
+        if (!content.trim()) continue;
+        const bounds = computeMeetingRecordSectionBoundsFromNoteContent(content, recordHint.id);
+        if (!bounds) continue;
+        const section = content.slice(bounds.start, bounds.end);
+        if (!section.trim()) continue;
+
+        // If user also asked an agenda subtopic, try to extract that section; otherwise return header+agenda list.
+        const subtopic = recordPrimarySubtopic;
+        const agenda =
+          subtopic ? extractAgendaSectionFromRecordSection(section, bounds.start, subtopic) : null;
+        const picked = agenda
+          ? { content: agenda.content, startChar: agenda.startChar, endChar: agenda.endChar }
+          : { content: section.slice(0, 1800), startChar: bounds.start, endChar: Math.min(bounds.end, bounds.start + 1800) };
+
+        const synthetic: SourceChunk = {
+          index: 1,
+          noteId,
+          filename,
+          content: picked.content,
+          startChar: picked.startChar,
+          endChar: picked.endChar,
+          similarity: 0.98,
+        };
+
+        // Reuse the existing code path by assigning to baseSources later.
+        // We return early with a simplified response to avoid duplicating the full pipeline.
+        const uiSourcesFallback: SourceChunk[] = (() => {
+          let s = synthetic;
+          // refine highlight for record heading if possible
+          const refined = refineRangeByMeetingRecordHeading(s.content, s.startChar, recordHint.id, 1100);
+          if (refined) s = { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+          return [s];
+        })();
+
+        const llmSourcesFallback: SourceChunk[] = uiSourcesFallback.map((s) => ({ ...s, content: s.content }));
+        const result = await askQuestion(question, llmSourcesFallback, {
+          focusTopic: recordPrimarySubtopic ?? undefined,
+          focusAspect: focus.aspectWord,
+        });
+
+        return NextResponse.json({
+          answer: stripMarkdownFormattingInAnswer(
+            normalizeAnswerCitationsToAvailableSources(result.answer, uiSourcesFallback)
+          ),
+          sources: uiSourcesFallback,
+          hasAnswer: result.hasAnswer,
+          rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+        });
+      }
+
+      // If record id was explicitly requested but we still couldn't locate it anywhere in notes,
+      // be explicit rather than repeatedly asking for "key terms".
+      return NextResponse.json({
+        answer: `我在当前已上传的笔记中没有找到“会议记录 ${recordHint.id}”对应的内容（也未找到包含该编号的会议纪要/会议纪要记录）。\n如果你确认已经上传了会议记录${recordHint.id}，请把对应文件/段落贴出来或重新上传，我再基于新增资料检索与问答。`,
+        sources: [],
+        hasAnswer: false,
+        rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+      });
+    }
+
     // Build base sources (full chunk content) for the LLM.
-    const baseSources: SourceChunk[] = finalRelevantChunks.map((row, index) => {
+    // Drop trivial one-character chunks (can appear due to chunking/artifacts), but never drop ALL.
+    const finalRelevantChunksNonTrivial = finalRelevantChunks.filter((r) => String(r.content || "").trim().length >= 3);
+    const finalRelevantChunksForSources =
+      finalRelevantChunksNonTrivial.length > 0 ? finalRelevantChunksNonTrivial : finalRelevantChunks;
+
+    const baseSources: SourceChunk[] = finalRelevantChunksForSources.map((row, index) => {
       const chunkStart =
         typeof row.start_char === "number" ? row.start_char : Number.parseInt(row.start_char, 10);
       const chunkEnd = typeof row.end_char === "number" ? row.end_char : Number.parseInt(row.end_char, 10);
@@ -3046,7 +3248,7 @@ export async function POST(req: NextRequest) {
       recordHint?.kind === "meeting" && recordHint.id && meetingSectionNoteId
         ? computeMeetingRecordSectionBounds(baseSources.filter((s) => s.noteId === meetingSectionNoteId), recordHint.id)
         : null;
-    const sectionScopedSources =
+    let sectionScopedSources =
       meetingSectionNoteId &&
       ((meetingSectionBoundsDb && Number.isFinite(meetingSectionBoundsDb.start)) ||
         (meetingSectionBounds && Number.isFinite(meetingSectionBounds.start)))
@@ -3069,6 +3271,41 @@ export async function POST(req: NextRequest) {
             return scoped;
           })()
         : baseSources;
+
+    // Fallback: if record-scoping produced an empty list (e.g. none of the top-K chunks came from that note),
+    // synthesize a single source by slicing the raw note content for that record section.
+    if (
+      sectionScopedSources.length === 0 &&
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      meetingSectionBoundsDb &&
+      meetingSectionNoteContent &&
+      Number.isFinite(meetingSectionBoundsDb.start) &&
+      Number.isFinite(meetingSectionBoundsDb.end)
+    ) {
+      const raw = meetingSectionNoteContent;
+      const start = meetingSectionBoundsDb.start;
+      const end = meetingSectionBoundsDb.end;
+      const sectionText = raw.slice(start, end);
+      if (sectionText.trim()) {
+        const picked = { content: sectionText.slice(0, 1800), startChar: start, endChar: Math.min(end, start + 1800) };
+        const filename =
+          recordRows.find((r) => r.note_id === meetingSectionBoundsDb.noteId)?.filename ??
+          baseSources.find((s) => s.noteId === meetingSectionBoundsDb.noteId)?.filename ??
+          "meeting_record";
+        sectionScopedSources = [
+          {
+            index: 1,
+            noteId: meetingSectionBoundsDb.noteId,
+            filename,
+            content: picked.content,
+            startChar: picked.startChar,
+            endChar: picked.endChar,
+            similarity: 0.98,
+          },
+        ];
+      }
+    }
 
     // If user did not use a recognizable "中提到的/的..." phrasing, try to infer subtopics directly
     // from the record's agenda list in the header and any explicit mentions in the question.
@@ -3293,6 +3530,8 @@ export async function POST(req: NextRequest) {
         .slice(0, LLM_TOP_K);
     })();
 
+    // (debug logging removed)
+
     // If this is a record + agenda-subtopic query and we have the raw note content,
     // build a single synthetic source from the exact agenda section in the note content.
     if (
@@ -3350,7 +3589,15 @@ export async function POST(req: NextRequest) {
     }
 
     // Re-index sources after any filtering so citations remain consistent.
-    const focusedSourcesReindexed: SourceChunk[] = focusedSources.map((s, i) => ({ ...s, index: i + 1 }));
+    // Also drop trivial one-character sources when we have better alternatives.
+    const focusedSourcesReindexedRaw: SourceChunk[] = focusedSources.map((s, i) => ({ ...s, index: i + 1 }));
+    const focusedSourcesReindexedNonTrivial = focusedSourcesReindexedRaw.filter(
+      (s) => String(s.content || "").trim().length >= 3
+    );
+    const focusedSourcesReindexed: SourceChunk[] =
+      focusedSourcesReindexedNonTrivial.length > 0 ? focusedSourcesReindexedNonTrivial : focusedSourcesReindexedRaw;
+
+    // (debug logging removed)
 
     // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
     const uiSources: SourceChunk[] = focusedSourcesReindexed.map((s) => {
@@ -3441,6 +3688,24 @@ export async function POST(req: NextRequest) {
       return s;
     });
 
+    // Ensure we never end up with empty sources for record-id queries when we did retrieve record-scoped candidates.
+    if (recordHint?.kind === "meeting" && recordHint.id && uiSources.length === 0 && focusedSources.length > 0) {
+      const fallbackUiSources = focusedSources.map((s, i) => ({ ...s, index: i + 1 }));
+      const llmSourcesFallback = fallbackUiSources.map((s) => ({ ...s, content: s.content }));
+      const result = await askQuestion(question, llmSourcesFallback, {
+        focusTopic: recordPrimarySubtopic ?? undefined,
+        focusAspect: focus.aspectWord,
+      });
+      return NextResponse.json({
+        answer: stripMarkdownFormattingInAnswer(
+          normalizeAnswerCitationsToAvailableSources(result.answer, fallbackUiSources)
+        ),
+        sources: fallbackUiSources,
+        hasAnswer: result.hasAnswer,
+        rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+      });
+    }
+
     // For definition-style questions, also clip the LLM context to the definition sentence/snippet.
     // This prevents the model from citing adjacent, unrelated concepts in the same long paragraph.
     const llmSources: SourceChunk[] =
@@ -3488,6 +3753,51 @@ export async function POST(req: NextRequest) {
     // - 1st time: ask user to clarify instead of claiming "no info"
     // - 2nd time (after user follow-up): be explicit that notes don't contain relevant material
     if (!result.hasAnswer) {
+      // Special-case: meeting record id queries are already highly specific. If we still have no sources,
+      // be explicit that this record id wasn't found in the uploaded notes (instead of asking for "key terms").
+      if (recordHint?.kind === "meeting" && recordHint.id && recordTokensStrict.length > 0 && uiSources.length === 0) {
+        const msg = `我在当前已上传的笔记中没有找到“会议记录 ${recordHint.id}”对应的内容（也未找到包含该编号的会议纪要/会议纪要记录）。\n如果你确认已经上传了会议记录013，请把对应文件/段落贴出来或重新上传，我再基于新增资料检索与问答。`;
+        return NextResponse.json({
+          answer: msg,
+          sources: [],
+          hasAnswer: false,
+          rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+        });
+      }
+
+      // Record overview fallback: if user asked about a specific record id (but not a specific subtopic),
+      // and we DO have scoped sources, extract the header fields directly instead of asking for clarification.
+      if (recordHint?.kind === "meeting" && recordHint.id && recordTokensStrict.length > 0 && !recordSubtopic && uiSources.length > 0) {
+        const header = pickMeetingRecordHeaderCandidate(uiSources);
+        if (header) {
+          const lines = header.content
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n")
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+          const keys = ["日期", "部门", "主持人", "参会人", "时长", "议题", "议题1", "议题2", "议题3"];
+          const picked: string[] = [];
+          for (const k of keys) {
+            const hit = lines.find((l) => l.includes(k) && (l.includes(":") || l.includes("：")));
+            if (hit && !picked.includes(hit)) picked.push(hit);
+          }
+          if (picked.length > 0) {
+            const answer = stripMarkdownFormattingInAnswer(
+              [`在你的笔记中，“会议记录 ${recordHint.id}”的基本信息/议题如下：`, ...picked.map((l) => `${l} [${header.index}]`)].join(
+                "\n"
+              )
+            );
+            return NextResponse.json({
+              answer,
+              sources: uiSources,
+              hasAnswer: true,
+              rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+            });
+          }
+        }
+      }
+
       // If the model refused due to "insufficient info" but sources contain the requested keyphrase,
       // extract evidence lines directly from sources rather than asking for more context.
       if (tailKeyphrase && uiSources.length > 0) {
