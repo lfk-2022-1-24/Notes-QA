@@ -1306,6 +1306,25 @@ function computeMeetingRecordSectionBoundsFromNoteContent(
   return { start: target, end };
 }
 
+function clipChunkToSection(
+  chunkContent: string,
+  chunkStartAbs: number,
+  chunkEndAbs: number,
+  sectionStartAbs: number,
+  sectionEndAbs: number
+): { content: string; startChar: number; endChar: number } | null {
+  if (!Number.isFinite(chunkStartAbs) || !Number.isFinite(chunkEndAbs)) return null;
+  if (!Number.isFinite(sectionStartAbs) || !Number.isFinite(sectionEndAbs)) return null;
+  const startAbs = Math.max(chunkStartAbs, sectionStartAbs);
+  const endAbs = Math.min(chunkEndAbs, sectionEndAbs);
+  if (!(endAbs > startAbs)) return null;
+  const relStart = Math.max(0, startAbs - chunkStartAbs);
+  const relEnd = Math.max(relStart, endAbs - chunkStartAbs);
+  const sliced = String(chunkContent || "").slice(relStart, relEnd);
+  if (!sliced.trim()) return null;
+  return { content: sliced, startChar: startAbs, endChar: endAbs };
+}
+
 function computeMeetingRecordSectionBounds(
   sources: SourceChunk[],
   targetId: string
@@ -1503,6 +1522,75 @@ function extractMeetingAgendaTitlesFromHeader(content: string): string[] {
     out.push(t);
   }
   return out.slice(0, 10);
+}
+
+function pickMeetingRecordHeaderCandidate(sources: SourceChunk[]): SourceChunk | null {
+  if (!sources || sources.length === 0) return null;
+  const withAgenda = sources.find((s) => /[-*+]\s*\*\*议题\*\*\s*[:：]/.test(String(s.content || "")));
+  if (withAgenda) return withAgenda;
+  // Otherwise pick the earliest chunk in the section.
+  const sorted = sources
+    .filter((s) => Number.isFinite(s.startChar))
+    .slice()
+    .sort((a, b) => (a.startChar as number) - (b.startChar as number));
+  return sorted[0] ?? sources[0] ?? null;
+}
+
+function stripParenSegments(s: string): string {
+  return (s || "")
+    .replace(/[\(（][^）\)]*[\)）]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function alignToAgendaTitles(raw: string, agendaTitles: string[]): string | null {
+  const r = stripParenSegments(raw);
+  if (!r) return null;
+  for (const t of agendaTitles) {
+    const tt = stripParenSegments(t);
+    if (!tt) continue;
+    if (includesLoose(tt, r) || includesLoose(r, tt)) return t;
+  }
+  return null;
+}
+
+function extractAgendaSectionFromRecordSection(
+  recordSectionText: string,
+  recordSectionStartAbs: number,
+  agendaTitle: string
+): { content: string; startChar: number; endChar: number } | null {
+  const raw = String(recordSectionText || "");
+  if (!raw.trim()) return null;
+  const target = stripParenSegments(agendaTitle);
+  if (!target) return null;
+
+  // Find the H2 agenda heading line.
+  const re = /^##\s*议题\s*\d+\s*[:：]\s*(.+?)\s*$/gm;
+  let m: RegExpExecArray | null;
+  let startRel: number | null = null;
+  while ((m = re.exec(raw))) {
+    const title = (m[1] || "").trim();
+    if (!title) continue;
+    const canon = stripParenSegments(title);
+    if (!canon) continue;
+    if (includesLoose(canon, target) || includesLoose(target, canon)) {
+      startRel = m.index;
+      break;
+    }
+  }
+  if (startRel == null) return null;
+
+  const after = raw.slice(startRel + 1);
+  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
+  const endRel = next >= 0 ? startRel + 1 + next : raw.length;
+
+  const startAbs = recordSectionStartAbs + startRel;
+  const endAbs = recordSectionStartAbs + endRel;
+  const snippet = raw.slice(startRel, endRel).trim();
+  if (!snippet) return null;
+  // Hard cap for LLM/UI payload size.
+  const capped = snippet.length > 1800 ? snippet.slice(0, 1800) : snippet;
+  return { content: capped, startChar: startAbs, endChar: startAbs + capped.length };
 }
 
 function refineRangeByNeedle(
@@ -2696,11 +2784,13 @@ export async function POST(req: NextRequest) {
 
     // If we have the noteId for record 002, compute exact section bounds using DB start_char ordering.
     let meetingSectionBoundsDb: { noteId: string; start: number; end: number } | null = null;
+    let meetingSectionNoteContent: string | null = null;
     if (recordHint?.kind === "meeting" && recordHint.id && recordNoteIds.size > 0) {
       const noteId = recordTargetNoteId ?? Array.from(recordNoteIds)[0]!;
       // Prefer note-level content bounds (more accurate than chunk boundaries when a chunk spans two records).
       const noteRow = await query(`SELECT content FROM notes WHERE id = $1 LIMIT 1`, [noteId]);
       const noteContent = String(noteRow.rows[0]?.content || "");
+      meetingSectionNoteContent = noteContent;
       const bounds = computeMeetingRecordSectionBoundsFromNoteContent(noteContent, recordHint.id);
       if (bounds) {
         meetingSectionBoundsDb = { noteId, start: bounds.start, end: bounds.end };
@@ -2733,7 +2823,7 @@ export async function POST(req: NextRequest) {
         FROM chunks c
         JOIN notes n ON n.id = c.note_id
         WHERE c.note_id = $2
-          AND c.start_char >= $3
+          AND c.end_char > $3
           AND c.start_char < $4
           AND c.content ILIKE '%## 议题%'
           AND c.content ILIKE $5
@@ -2960,9 +3050,7 @@ export async function POST(req: NextRequest) {
       meetingSectionNoteId &&
       ((meetingSectionBoundsDb && Number.isFinite(meetingSectionBoundsDb.start)) ||
         (meetingSectionBounds && Number.isFinite(meetingSectionBounds.start)))
-        ? baseSources.filter((s) => {
-            if (s.noteId !== meetingSectionNoteId) return false;
-            if (!Number.isFinite(s.startChar) || !Number.isFinite(s.endChar)) return false;
+        ? (() => {
             const start =
               meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId
                 ? meetingSectionBoundsDb.start
@@ -2971,15 +3059,21 @@ export async function POST(req: NextRequest) {
               meetingSectionBoundsDb && meetingSectionBoundsDb.noteId === meetingSectionNoteId
                 ? meetingSectionBoundsDb.end
                 : meetingSectionBounds!.end;
-            // Keep any chunk that overlaps the section, not only those whose start is inside.
-            return s.endChar > start && s.startChar < end;
-          })
+            const scoped = baseSources
+              .filter((s) => s.noteId === meetingSectionNoteId && Number.isFinite(s.startChar) && Number.isFinite(s.endChar))
+              .map((s) => {
+                const clipped = clipChunkToSection(s.content, s.startChar, s.endChar, start, end);
+                return clipped ? { ...s, content: clipped.content, startChar: clipped.startChar, endChar: clipped.endChar } : null;
+              })
+              .filter(Boolean) as SourceChunk[];
+            return scoped;
+          })()
         : baseSources;
 
     // If user did not use a recognizable "中提到的/的..." phrasing, try to infer subtopics directly
     // from the record's agenda list in the header and any explicit mentions in the question.
     if (recordHint?.kind === "meeting" && recordHint.id) {
-      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const header = pickMeetingRecordHeaderCandidate(sectionScopedSources);
       const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
       if (agendaTitles.length > 0) {
         const mentions = agendaTitles.filter((t) => includesLoose(retrievalQuestion, t));
@@ -2991,6 +3085,27 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // If we extracted a subtopic but it doesn't exactly match the agenda title (e.g. missing "(SLA)"),
+    // align it to the canonical agenda title so heading matching works.
+    if (recordHint?.kind === "meeting" && recordHint.id && (recordSubtopic || recordSubtopics.length > 0)) {
+      const header = pickMeetingRecordHeaderCandidate(sectionScopedSources);
+      const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
+      if (agendaTitles.length > 0) {
+        if (recordSubtopic) {
+          const aligned = alignToAgendaTitles(recordSubtopic, agendaTitles);
+          if (aligned) recordSubtopic = aligned;
+        }
+        if (recordSubtopics.length > 0) {
+          const mapped: string[] = [];
+          for (const t of recordSubtopics) {
+            mapped.push(alignToAgendaTitles(t, agendaTitles) ?? t);
+          }
+          recordSubtopics = Array.from(new Set(mapped)).slice(0, 4);
+        }
+        recordPrimarySubtopic = recordSubtopic ?? recordSubtopics[0] ?? recordPrimarySubtopic;
+      }
+    }
+
     // If still no subtopic extracted but the user mentions an agenda title-like phrase,
     // try to align it to one of the agenda titles.
     if (
@@ -2999,7 +3114,7 @@ export async function POST(req: NextRequest) {
       recordSubtopics.length === 0 &&
       recordSubtopic == null
     ) {
-      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const header = pickMeetingRecordHeaderCandidate(sectionScopedSources);
       const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
       const candidates = extractMeetingAgendaSubtopicCandidatesFromQuestion(retrievalQuestion);
       if (agendaTitles.length > 0 && candidates.length > 0) {
@@ -3025,7 +3140,7 @@ export async function POST(req: NextRequest) {
       recordSubtopic == null &&
       isLikelyMeetingAgendaQuestion(retrievalQuestion)
     ) {
-      const header = sectionScopedSources.find((s) => detectMeetingRecordHeadingId(s.content) === recordHint.id);
+      const header = pickMeetingRecordHeaderCandidate(sectionScopedSources);
       const agendaTitles = header ? extractMeetingAgendaTitlesFromHeader(header.content) : [];
       if (agendaTitles.length > 0) {
         const hits = agendaTitles.filter((t) => includesLoose(question, t) || includesLoose(retrievalQuestion, t));
@@ -3040,7 +3155,7 @@ export async function POST(req: NextRequest) {
     // Pick LLM sources.
     // - If focus.topic exists, keep only those mentioning the topic.
     // - If the question is a definition ("X是什么"), prefer sources that mention X to avoid unrelated chunks.
-    const focusedSources = (() => {
+    let focusedSources = (() => {
       const sources = sectionScopedSources;
       // If the note contains the user's question as an almost-exact string (common in Q/A txt),
       // aggressively prefer that chunk to avoid citing adjacent template/metadata blocks.
@@ -3178,6 +3293,45 @@ export async function POST(req: NextRequest) {
         .slice(0, LLM_TOP_K);
     })();
 
+    // If this is a record + agenda-subtopic query and we have the raw note content,
+    // build a single synthetic source from the exact agenda section in the note content.
+    if (
+      recordHint?.kind === "meeting" &&
+      recordHint.id &&
+      recordPrimarySubtopic &&
+      meetingSectionBoundsDb &&
+      meetingSectionNoteContent
+    ) {
+      const sectionText = meetingSectionNoteContent.slice(meetingSectionBoundsDb.start, meetingSectionBoundsDb.end);
+      const agenda = extractAgendaSectionFromRecordSection(sectionText, meetingSectionBoundsDb.start, recordPrimarySubtopic);
+      if (agenda) {
+        const filename = baseSources.find((s) => s.noteId === meetingSectionBoundsDb.noteId)?.filename ?? "meeting_record";
+        focusedSources = [
+          {
+            index: 1,
+            noteId: meetingSectionBoundsDb.noteId,
+            filename,
+            content: agenda.content,
+            startChar: agenda.startChar,
+            endChar: agenda.endChar,
+            similarity: 0.99,
+          },
+        ];
+      }
+    }
+
+    // Record + subtopic strictness: if user asked about specific agenda subtopic(s),
+    // only keep sources that truly contain the corresponding "## 议题N: <subtopic>" section.
+    if (recordTokensStrict.length > 0) {
+      const subtopics = recordSubtopics.length > 0 ? recordSubtopics : recordSubtopic ? [recordSubtopic] : [];
+      if (subtopics.length > 0 && focusedSources.length > 1) {
+        const agendaOnly = focusedSources.filter((s) =>
+          subtopics.some((t) => Boolean(refineRangeByMeetingAgendaSubtopic(s.content, 0, t, 280)))
+        );
+        if (agendaOnly.length > 0) focusedSources = agendaOnly.slice(0, LLM_TOP_K);
+      }
+    }
+
     // Guardrail: if the user asks about a clear topic ("X是什么"/"X包括什么"/focus patterns),
     // but we failed to retrieve any chunk mentioning that topic, don't answer with unrelated citations.
     if (topicHint && recordTokensStrict.length === 0 && !focusedSources.some((s) => includesTopicLoose(s.content, topicHint))) {
@@ -3195,8 +3349,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // Re-index sources after any filtering so citations remain consistent.
+    const focusedSourcesReindexed: SourceChunk[] = focusedSources.map((s, i) => ({ ...s, index: i + 1 }));
+
     // Build UI sources: same indices as LLM sources, but with a refined highlight range and a shorter snippet.
-    const uiSources: SourceChunk[] = focusedSources.map((s) => {
+    const uiSources: SourceChunk[] = focusedSourcesReindexed.map((s) => {
       if (!Number.isFinite(s.startChar)) return s;
 
       const lowerName = (s.filename || "").toLowerCase();
@@ -3288,22 +3445,22 @@ export async function POST(req: NextRequest) {
     // This prevents the model from citing adjacent, unrelated concepts in the same long paragraph.
     const llmSources: SourceChunk[] =
       defTopic
-        ? focusedSources.map((s) => {
+        ? focusedSourcesReindexed.map((s) => {
             const refined = refineRangeByDefinitionTopic(s.content, 0, defTopic);
             return refined ? { ...s, content: refined.content } : s;
           })
         : dateHint
-          ? focusedSources.map((s) => {
+          ? focusedSourcesReindexed.map((s) => {
               const refined = refineRangeByAnyLogDateHeading(s.content, 0, dateHint, dateVariants, 1800);
               return refined ? { ...s, content: refined.content } : s;
             })
           : tailKeyphrase === "训练策略" || trainingBoostTokens.length > 0
-            ? focusedSources.map((s) => {
+            ? focusedSourcesReindexed.map((s) => {
                 const refined = refineRangeByTrainingStrategyCue(s.content, 0, 900);
                 return refined ? { ...s, content: refined.content } : s;
               })
             : recordHint?.kind === "meeting" && recordHint.id
-              ? focusedSources.map((s) => {
+              ? focusedSourcesReindexed.map((s) => {
                   const refined = recordSubtopic
                     ? refineRangeByMeetingAgendaSubtopic(s.content, 0, recordSubtopic, 1400) ??
                       refineRangeByNeedle(s.content, 0, recordSubtopic, 1200) ??
@@ -3311,7 +3468,7 @@ export async function POST(req: NextRequest) {
                     : refineRangeByMeetingRecordHeading(s.content, 0, recordHint.id, 1200);
                   return refined ? { ...s, content: refined.content } : s;
                 })
-              : focusedSources;
+              : focusedSourcesReindexed;
 
     // Ask LLM with sources
     const result = await askQuestion(question, llmSources, {
