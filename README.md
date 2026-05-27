@@ -4,20 +4,8 @@
 
 我实现了一个“把你的笔记当作唯一事实来源”的 Notes QA 原型：你可以上传自己的笔记（支持 `.md/.txt/.pdf/.docx`），系统会解析文本、按段落/句子分块并生成向量，存入 Postgres（pgvector）。提问时服务端会做向量检索 + 关键词召回（embedding 不可用时自动降级为纯关键词检索），把命中的文本块作为 `[Source n]` 提供给 LLM，并强制“每个论点都必须带引用 [n]；若资料不足则明确无答案”。前端把回答中的 `[n]` 渲染为可点击引用，点击后会自动展开对应笔记并按 `start_char/end_char` 高亮到具体段落，方便人工核验。对于笔记里没有答案的问题，系统会先请求你补充上下文；如果追问后仍无证据，则明确说明当前笔记无法支撑作答。
 
-（本地运行）配置环境变量 `DATABASE_URL`、`ARK_API_KEY`、`DEEPSEEK_API_KEY`（可选：`ARK_*`、`DEEPSEEK_*` 模型/超时），然后 `npm i && npm run dev`。
+（本地运行）配置环境变量 `DATABASE_URL`、`ARK_API_KEY`、`DEEPSEEK_API_KEY`（可选：`ARK_*`、`DEEPSEEK_*` 模型/超时），然后 `npm i && npm run start`。
 
-## 通过内网穿透/公网域名访问时“不能上传”的常见原因
-
-如果你是用 `npm run dev`（开发模式）跑起来，再通过内网穿透（例如 `frp57.llt-service.cn`）给其他电脑访问，Next.js 会出于安全默认**阻止外部域名访问 dev 资源**（`/_next/*`、HMR、字体等）。页面脚本/样式可能加载不完整，从而表现为“上传不可用/请求发不出去”。
-
-本项目已支持通过环境变量允许 dev 访问来源：
-
-- **设置环境变量**：`NEXT_ALLOWED_DEV_ORIGINS=frp57.llt-service.cn`（多个用逗号分隔）
-- **重启 dev**：修改后需要重启 `npm run dev`
-
-更推荐的做法是用生产模式对外提供访问：
-
-- **构建并启动**：`npm run build && npm run start`
 
 ## 我选择不做什么（以及为什么）
 
