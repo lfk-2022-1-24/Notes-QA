@@ -1909,6 +1909,18 @@ function isLikelyRecordFollowupQuestion(question: string): boolean {
   return false;
 }
 
+function chunkHasMeetingRecordHeadingId(content: string, recordId: string): boolean {
+  const idCore = (recordId || "").replace(/^0+/, "") || recordId;
+  if (!idCore) return false;
+  const text = String(content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Match both markdown headings and plain-text headings.
+  const re = new RegExp(
+    String.raw`(?:^|\n)\s*(?:#{1,6}\s*)?(?:会议记录|会议纪要|会议纪要记录)\s*0*${escapeRegExp(idCore)}(?![0-9])`,
+    "m"
+  );
+  return re.test(text);
+}
+
 function findBestKeywordMatchIndex(text: string, tokens: string[]): number | null {
   if (tokens.length === 0) return null;
 
@@ -3307,6 +3319,51 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Record overview multi-note support:
+    // If the same record exists in multiple notes (e.g. user uploaded both .md and .txt copies),
+    // synthesize one source per note so the citations panel can show all copies.
+    let recordOverviewPerNoteSources: SourceChunk[] = [];
+    if (recordHint?.kind === "meeting" && recordHint.id && recordTokensStrict.length > 0 && !recordPrimarySubtopic) {
+      const likes = buildMeetingRecordTokensStrict(recordHint.id).slice(0, 12).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(n.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+      const noteRes = await query(
+        `SELECT n.id, n.filename, n.content
+         FROM notes n
+         WHERE ${where}
+         ORDER BY n.id
+         LIMIT $1`,
+        [6, ...likes]
+      );
+
+      const picked: SourceChunk[] = [];
+      const seen = new Set<string>();
+      for (const row of noteRes.rows) {
+        const noteId = String(row.id || "");
+        if (!noteId || seen.has(noteId)) continue;
+        seen.add(noteId);
+        const filename = String(row.filename || "meeting_record");
+        const noteContent = String(row.content || "");
+        if (!noteContent.trim()) continue;
+        const bounds = computeMeetingRecordSectionBoundsFromNoteContent(noteContent, recordHint.id);
+        if (!bounds) continue;
+        const section = noteContent.slice(bounds.start, bounds.end);
+        if (!section.trim()) continue;
+        const snippet = section.slice(0, 1500);
+        picked.push({
+          index: picked.length + 1,
+          noteId,
+          filename,
+          content: snippet,
+          startChar: bounds.start,
+          endChar: Math.min(bounds.end, bounds.start + snippet.length),
+          similarity: 0.92,
+        });
+      }
+
+      // Only activate when we truly found multiple distinct notes.
+      if (picked.length >= 2) recordOverviewPerNoteSources = picked.slice(0, LLM_TOP_K);
+    }
+
     // If user did not use a recognizable "中提到的/的..." phrasing, try to infer subtopics directly
     // from the record's agenda list in the header and any explicit mentions in the question.
     if (recordHint?.kind === "meeting" && recordHint.id) {
@@ -3529,6 +3586,12 @@ export async function POST(req: NextRequest) {
         )
         .slice(0, LLM_TOP_K);
     })();
+
+    // If this is a record overview query and we found multiple per-note sources (md/txt),
+    // prefer showing one source per note.
+    if (recordHint?.kind === "meeting" && recordHint.id && !recordPrimarySubtopic && recordOverviewPerNoteSources.length >= 2) {
+      focusedSources = recordOverviewPerNoteSources.slice(0, LLM_TOP_K);
+    }
 
     // (debug logging removed)
 
