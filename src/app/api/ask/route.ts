@@ -487,6 +487,43 @@ function trimLeadingToBoldHeading(
   return { snippet: out, delta: pickIdx };
 }
 
+function trimLeadingToMarkdownHeading(
+  snippet: string,
+  preferredToken?: string
+): { snippet: string; delta: number } {
+  if (!snippet) return { snippet, delta: 0 };
+  const matches: { idx: number; title: string }[] = [];
+  for (const m of snippet.matchAll(/(?:^|[\n\r]|[-*_]{3,}\s*)(#{1,6})\s+([^\n]+)/g)) {
+    if (m.index === undefined) continue;
+    const full = m[0] || "";
+    const hashPos = full.indexOf("#");
+    const idx = m.index + Math.max(0, hashPos);
+    matches.push({ idx, title: (m[2] || "").trim() });
+  }
+  if (matches.length === 0) return { snippet, delta: 0 };
+
+  const pickIdx = (() => {
+    if (preferredToken) {
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const it = matches[i]!;
+        if (includesLoose(it.title, preferredToken)) return it.idx;
+      }
+    }
+    // Fall back to the last heading if there is visible content before it.
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const it = matches[i]!;
+      const prefix = snippet.slice(0, it.idx).trim();
+      if (prefix.length >= 12) return it.idx;
+    }
+    return null;
+  })();
+
+  if (pickIdx === null || pickIdx <= 0) return { snippet, delta: 0 };
+  const out = snippet.slice(pickIdx);
+  if (!out.trim()) return { snippet, delta: 0 };
+  return { snippet: out, delta: pickIdx };
+}
+
 function buildLfTextAndMap(orig: string): { text: string; map: number[] } {
   // Normalize CRLF -> LF for matching/regex, while keeping a mapping to original indices.
   // map[normIndex] = origIndex
@@ -1149,6 +1186,9 @@ function extractTailKeyphrase(question: string): string | null {
   // Keep this conservative: only keyphrases that strongly indicate the user intent.
   if (q.includes("训练策略")) return "训练策略";
   if (q.includes("优化策略")) return "优化策略";
+  if (q.includes("实验结果")) return "实验结果";
+  if (q.includes("性能分析")) return "性能分析";
+  if (q.includes("实验指标")) return "实验指标";
   return null;
 }
 
@@ -1190,6 +1230,37 @@ function extractTrainingStrategyBoostTokens(question: string): string[] {
     "DDP",
     "distributed",
     "data parallel",
+  ];
+  return Array.from(new Set(tokens)).slice(0, 18);
+}
+
+function extractResultBoostTokens(question: string): string[] {
+  const q = (question || "").trim();
+  if (!q || !isResultOrExperimentQuestion(q)) return [];
+
+  const tokens = [
+    "实验结果",
+    "实验",
+    "结果",
+    "性能分析",
+    "性能",
+    "指标",
+    "评估",
+    "对比实验",
+    "实验设置",
+    "准确率",
+    "精确率",
+    "召回率",
+    "F1",
+    "AUC",
+    "ACC",
+    "loss",
+    "提升",
+    "下降",
+    "baseline",
+    "ablation",
+    "消融",
+    "对比学习",
   ];
   return Array.from(new Set(tokens)).slice(0, 18);
 }
@@ -2231,7 +2302,24 @@ function refineRangeByMarkdownLineMatch(
         }
 
         if (endIdx - startIdx > maxLen) endIdx = startIdx + maxLen;
-        const mapped = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
+
+        // For long overview sections, do not always highlight from the section top.
+        // If the actual keyword match is deeper in the section, tighten to the local
+        // paragraph/sentence around the match while staying inside this section.
+        let finalStartIdx = startIdx;
+        let finalEndIdx = endIdx;
+        const localMatchIdx = Math.max(0, Math.min(matchIdx - startIdx, Math.max(0, endIdx - startIdx - 1)));
+        if (matchIdx > startIdx + 90) {
+          const localText = text.slice(startIdx, endIdx);
+          const tight =
+            tokens.length <= 1
+              ? getSentenceBounds(localText, localMatchIdx, { maxLen })
+              : getTightBounds(localText, localMatchIdx);
+          finalStartIdx = startIdx + tight.startIdx;
+          finalEndIdx = Math.min(endIdx, startIdx + tight.endIdx);
+        }
+
+        const mapped = mapNormRangeToOrig(map, finalStartIdx, finalEndIdx, chunkContent.length);
         const snippet = chunkContent.slice(mapped.start, mapped.end);
         if (snippet.trim()) {
           return { content: snippet, startChar: chunkStartAbs + mapped.start, endChar: chunkStartAbs + mapped.end };
@@ -2371,6 +2459,13 @@ function refineRangeByMarkdownLineMatch(
       mapped.start = mapped.start + trimmed.delta;
     }
   }
+  {
+    const trimmed = trimLeadingToMarkdownHeading(snippet, mainToken);
+    if (trimmed.delta > 0) {
+      snippet = trimmed.snippet;
+      mapped.start = mapped.start + trimmed.delta;
+    }
+  }
   // If the snippet accidentally includes a prefix before an inline heading marker, drop that prefix.
   const inlineHeading = snippet.search(/#{1,6}\s+\S+/);
   if (inlineHeading > 0) {
@@ -2491,6 +2586,11 @@ function refineRangeByQuestionMatch(
       snippet = trimmed.snippet;
       mapped.start = mapped.start + trimmed.delta;
     }
+    const headingTrimmed = trimLeadingToMarkdownHeading(snippet, mainToken);
+    if (headingTrimmed.delta > 0) {
+      snippet = headingTrimmed.snippet;
+      mapped.start = mapped.start + headingTrimmed.delta;
+    }
   }
   if (!snippet.trim()) return null;
 
@@ -2567,6 +2667,7 @@ export async function POST(req: NextRequest) {
     const qNum = extractQuestionNumber(question) ?? extractQuestionNumber(retrievalQuestion);
     const tailKeyphrase = extractTailKeyphrase(retrievalQuestion);
     const trainingBoostTokens = extractTrainingStrategyBoostTokens(retrievalQuestion);
+    const resultBoostTokens = extractResultBoostTokens(retrievalQuestion);
     // For record-scoped detection, prefer the ORIGINAL question: rewrites can reorder phrases
     // and break "对于X，会议记录002..." style extraction.
     const recordHintRaw = extractRecordIdHint(question) ?? extractRecordIdHint(retrievalQuestion);
@@ -2834,6 +2935,34 @@ export async function POST(req: NextRequest) {
       }));
     }
 
+    // Experiment/result fallback: long title-like queries often need explicit result/metric cues
+    // to avoid being dominated by the topic prefix.
+    let resultRows: SearchRow[] = [];
+    if (resultBoostTokens.length > 0) {
+      const likes = resultBoostTokens.slice(0, 10).map((t) => `%${t}%`);
+      const where = likes.map((_, i) => `(c.content ILIKE $${i + 2} OR n.filename ILIKE $${i + 2})`).join(" OR ");
+      const resultResult = await query(
+        `SELECT
+          c.id,
+          c.note_id,
+          c.content,
+          c.start_char,
+          c.end_char,
+          n.filename,
+          0.0 AS similarity
+        FROM chunks c
+        JOIN notes n ON n.id = c.note_id
+        WHERE ${where}
+        ORDER BY c.id
+        LIMIT $1`,
+        [KEYWORD_K, ...likes]
+      );
+      resultRows = resultResult.rows.map((r) => ({
+        ...(r as Omit<SearchRow, "similarity">),
+        similarity: parseFloat(r.similarity),
+      }));
+    }
+
     // Meeting-record fallback: if the question names a specific record id (e.g. "会议记录 002"),
     // recall chunks by matching the record id in content/filename.
     let recordRows: SearchRow[] = [];
@@ -3019,6 +3148,7 @@ export async function POST(req: NextRequest) {
     for (const r of keywordRows) mergedKw.set(r.id, r);
     for (const r of dateRows) mergedKw.set(r.id, r);
     for (const r of trainingRows) mergedKw.set(r.id, r);
+    for (const r of resultRows) mergedKw.set(r.id, r);
     for (const r of recordRows) mergedKw.set(r.id, r);
     for (const r of recordSubtopicRows) mergedKw.set(r.id, r);
     for (const r of recordSubtopicsRows) mergedKw.set(r.id, r);
@@ -3050,6 +3180,12 @@ export async function POST(req: NextRequest) {
       if (trainingBoostTokens.length > 0) {
         let hits = 0;
         for (const t of trainingBoostTokens) if (includesLoose(c, t)) hits++;
+        if (hits >= 2) s += 6;
+        else if (hits >= 1) s += 3;
+      }
+      if (resultBoostTokens.length > 0) {
+        let hits = 0;
+        for (const t of resultBoostTokens) if (includesLoose(c, t)) hits++;
         if (hits >= 2) s += 6;
         else if (hits >= 1) s += 3;
       }
@@ -3103,6 +3239,7 @@ export async function POST(req: NextRequest) {
       new Set<string>([
         ...(tailKeyphrase ? [tailKeyphrase] : []),
         ...(trainingBoostTokens.slice(0, 2)),
+        ...(resultBoostTokens.slice(0, 3)),
         ...(recordTokensLoose.slice(0, 2)),
         ...(topicHint ? topicTokenVariants(topicHint).slice(0, 2) : []),
         ...(focus.aspectWord ? [focus.aspectWord] : []),
@@ -3716,6 +3853,20 @@ export async function POST(req: NextRequest) {
         }
       }
 
+      if (isResultOrExperimentQuestion(retrievalQuestion)) {
+        const resultNeedle =
+          tailKeyphrase === "实验结果" || tailKeyphrase === "实验指标" || tailKeyphrase === "性能分析"
+            ? tailKeyphrase
+            : "实验结果";
+        const refined =
+          refineRangeByNeedle(s.content, s.startChar, resultNeedle, 620) ??
+          refineRangeByNeedle(s.content, s.startChar, "性能", 520) ??
+          refineRangeByNeedle(s.content, s.startChar, "指标", 520);
+        if (refined) {
+          return { ...s, content: refined.content, startChar: refined.startChar, endChar: refined.endChar };
+        }
+      }
+
       if (recordHint?.kind === "meeting" && recordHint.id) {
         if (recordSubtopic) {
           const refined =
@@ -3820,6 +3971,18 @@ export async function POST(req: NextRequest) {
                 const refined = refineRangeByTrainingStrategyCue(s.content, 0, 900);
                 return refined ? { ...s, content: refined.content } : s;
               })
+            : isResultOrExperimentQuestion(retrievalQuestion)
+              ? focusedSourcesReindexed.map((s) => {
+                  const resultNeedle =
+                    tailKeyphrase === "实验结果" || tailKeyphrase === "实验指标" || tailKeyphrase === "性能分析"
+                      ? tailKeyphrase
+                      : "实验结果";
+                  const refined =
+                    refineRangeByNeedle(s.content, 0, resultNeedle, 900) ??
+                    refineRangeByNeedle(s.content, 0, "性能", 800) ??
+                    refineRangeByNeedle(s.content, 0, "指标", 800);
+                  return refined ? { ...s, content: refined.content } : s;
+                })
             : recordHint?.kind === "meeting" && recordHint.id
               ? focusedSourcesReindexed.map((s) => {
                   const refined = recordSubtopic

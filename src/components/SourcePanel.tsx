@@ -199,6 +199,7 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
         /^#?\s*日志\s*20\d{2}年\d{1,2}月\d{1,2}[日号]\b/.test(a)
       );
     })();
+    const anchorLooksLikeMarkdownHeading = /^\s*#{1,6}\s+\S+/.test((highlight.anchorText || "").trim());
 
     // Stronger anchor alignment:
     // - only search for anchor within a window around the provided offsets (or start of doc as fallback)
@@ -206,7 +207,7 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
     //
     // IMPORTANT: for date-scoped log queries, trust backend offsets to avoid "drift" across repeated templates.
     if (highlight.anchorText) {
-      if (isDateQuery || anchorLooksLikeLogHeading) {
+      if (isDateQuery || anchorLooksLikeLogHeading || anchorLooksLikeMarkdownHeading) {
         // Skip anchor-based realignment for log/date queries.
       } else {
       const anchor = highlight.anchorText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().slice(0, 260);
@@ -222,6 +223,12 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
           const absIdx = winStart + localIdx;
           const localSecond = windowText.indexOf(anchor, localIdx + 1);
           const uniqueInWindow = localSecond < 0;
+          const providedSlice =
+            isRangeValid && endChar > startChar ? doc.slice(startChar, Math.min(doc.length, endChar + 80)) : "";
+          const alreadyAligned =
+            anchor.length >= 16 &&
+            providedSlice.length > 0 &&
+            (providedSlice.includes(anchor) || anchor.includes(providedSlice.trim()));
 
           // Verify token hits around match.
           const verifyStart = Math.max(0, absIdx - 200);
@@ -233,8 +240,12 @@ export default function SourcePanel({ refreshKey, highlight }: SourcePanelProps)
           // This prevents drifting upwards into repeated "template" sections in txt notes.
           const closeToProvided =
             !isRangeValid || Math.abs(absIdx - startChar) <= 600;
+          // Even within the guard window, avoid moving the highlight upward by a lot.
+          // Repeated section titles often appear above the true evidence block.
+          const notPullingUpTooFar =
+            !isRangeValid || absIdx >= startChar || startChar - absIdx <= 80;
 
-          if (uniqueInWindow && okByTokens && closeToProvided) {
+          if (!alreadyAligned && uniqueInWindow && okByTokens && closeToProvided && notPullingUpTooFar) {
             // Only adjust the start position; preserve the intended highlight length
             // from backend to avoid over-highlighting for docx/doc paragraphs.
             const len = Number.isFinite(endChar) && Number.isFinite(startChar) ? Math.max(40, endChar - startChar) : anchor.length;
