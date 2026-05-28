@@ -1769,20 +1769,15 @@ function extractMeetingAgendaEvidenceLines(content: string, subtopic: string, ma
   if (!t) return [];
   const text = (content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (!text.trim()) return [];
-  const re = new RegExp(String.raw`^\s*##\s*议题\s*\d+\s*[:：]\s*${escapeRegExp(t)}(?:\s|$).*`, "m");
-  const m = text.match(re);
-  if (!m || m.index === undefined) return [];
-  const startIdx = m.index;
-  const after = text.slice(startIdx + 1);
-  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
-  const endIdx = next >= 0 ? startIdx + 1 + next : text.length;
-  const section = text.slice(startIdx, endIdx);
+  const bounds = findMeetingAgendaSectionBounds(text, t);
+  if (!bounds) return [];
+  const section = text.slice(bounds.startRel, bounds.endRel);
   const lines = section
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
     // Drop the heading itself; keep content cues.
-    .filter((l) => !/^##\s*议题\s*\d+\s*[:：]/.test(l))
+    .filter((l) => !/^\s*(?:#{1,6}\s*)?议题\s*\d+\s*[:：]/.test(l))
     // Avoid checklist-style action items if they appear.
     .filter((l) => !/^\[\s*[xX ]\s*\]\s+/.test(l) && !/^-\s*\[\s*[xX ]\s*\]\s+/.test(l));
 
@@ -1972,6 +1967,43 @@ function alignToAgendaTitles(raw: string, agendaTitles: string[]): string | null
   return null;
 }
 
+function meetingAgendaHeadingScanRe(): RegExp {
+  return /^\s*(?:#{1,6}\s*)?议题\s*\d+\s*[:：]\s*(.+?)\s*$/gm;
+}
+
+function meetingAgendaNextSectionRe(): RegExp {
+  return /^\s*(?:#{1,6}\s*)?(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m;
+}
+
+function meetingAgendaHeadingLineRe(title: string): RegExp {
+  const t = (title || "").trim();
+  return new RegExp(String.raw`^\s*(?:#{1,6}\s*)?议题\s*\d+\s*[:：]\s*${escapeRegExp(t)}(?:\s|$).*`, "m");
+}
+
+function findMeetingAgendaSectionBounds(
+  raw: string,
+  agendaTitle: string
+): { startRel: number; endRel: number } | null {
+  const target = stripParenSegments(agendaTitle);
+  if (!target || !raw.trim()) return null;
+  const scanRe = meetingAgendaHeadingScanRe();
+  let m: RegExpExecArray | null;
+  let startRel: number | null = null;
+  while ((m = scanRe.exec(raw))) {
+    const title = stripParenSegments((m[1] || "").trim());
+    if (!title) continue;
+    if (includesLoose(title, target) || includesLoose(target, title)) {
+      startRel = m.index!;
+      break;
+    }
+  }
+  if (startRel == null) return null;
+  const after = raw.slice(startRel + 1);
+  const next = after.search(meetingAgendaNextSectionRe());
+  const endRel = next >= 0 ? startRel + 1 + next : raw.length;
+  return { startRel, endRel };
+}
+
 function extractAgendaSectionFromRecordSection(
   recordSectionText: string,
   recordSectionStartAbs: number,
@@ -1979,34 +2011,13 @@ function extractAgendaSectionFromRecordSection(
 ): { content: string; startChar: number; endChar: number } | null {
   const raw = String(recordSectionText || "");
   if (!raw.trim()) return null;
-  const target = stripParenSegments(agendaTitle);
-  if (!target) return null;
+  const bounds = findMeetingAgendaSectionBounds(raw, agendaTitle);
+  if (!bounds) return null;
 
-  // Find the H2 agenda heading line.
-  const re = /^##\s*议题\s*\d+\s*[:：]\s*(.+?)\s*$/gm;
-  let m: RegExpExecArray | null;
-  let startRel: number | null = null;
-  while ((m = re.exec(raw))) {
-    const title = (m[1] || "").trim();
-    if (!title) continue;
-    const canon = stripParenSegments(title);
-    if (!canon) continue;
-    if (includesLoose(canon, target) || includesLoose(target, canon)) {
-      startRel = m.index;
-      break;
-    }
-  }
-  if (startRel == null) return null;
-
-  const after = raw.slice(startRel + 1);
-  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
-  const endRel = next >= 0 ? startRel + 1 + next : raw.length;
-
-  const startAbs = recordSectionStartAbs + startRel;
-  const endAbs = recordSectionStartAbs + endRel;
-  const snippet = raw.slice(startRel, endRel).trim();
+  const startAbs = recordSectionStartAbs + bounds.startRel;
+  const endAbs = recordSectionStartAbs + bounds.endRel;
+  const snippet = raw.slice(bounds.startRel, bounds.endRel).trim();
   if (!snippet) return null;
-  // Hard cap for LLM/UI payload size.
   const capped = snippet.length > 1800 ? snippet.slice(0, 1800) : snippet;
   return { content: capped, startChar: startAbs, endChar: startAbs + capped.length };
 }
@@ -2044,17 +2055,15 @@ function refineRangeByMeetingAgendaSubtopic(
   if (!t) return null;
   const { text, map } = buildLfTextAndMap(chunkContent);
   if (!text.trim()) return null;
-  // Prefer a markdown heading like "## 议题3: <t>" (tolerant to "**背景**" on same line).
-  const re = new RegExp(String.raw`^\s*##\s*议题\s*\d+\s*[:：]\s*${escapeRegExp(t)}(?:\s|$).*`, "m");
+  const re = meetingAgendaHeadingLineRe(t);
   const m = text.match(re);
   const idx = m && m.index !== undefined ? m.index : -1;
   if (idx < 0) return null;
 
   const startIdx = idx;
-  // End at next "## 议题" or "## 行动项汇总" or next H2 heading.
-  const after = text.slice(idx + 1);
-  const next = after.search(/^\s*##\s+(?:议题\s*\d+\s*[:：]|行动项汇总)\s*/m);
-  const endIdx = next >= 0 ? Math.min(text.length, idx + 1 + next) : Math.min(text.length, startIdx + maxLen);
+  const after = text.slice(idx + Math.max(m![0].length, 1));
+  const next = after.search(meetingAgendaNextSectionRe());
+  const endIdx = next >= 0 ? idx + Math.max(m![0].length, 1) + next : Math.min(text.length, startIdx + maxLen);
 
   const mappedRange = mapNormRangeToOrig(map, startIdx, endIdx, chunkContent.length);
   const snippet = chunkContent.slice(mappedRange.start, mappedRange.end);
@@ -3434,7 +3443,7 @@ export async function POST(req: NextRequest) {
         WHERE c.note_id = $2
           AND c.end_char > $3
           AND c.start_char < $4
-          AND c.content ILIKE '%## 议题%'
+          AND (c.content ILIKE '%## 议题%' OR c.content ~* '议题[0-9]+[[:space:]]*[:：]')
           AND c.content ILIKE $5
         ORDER BY c.start_char ASC
         LIMIT $1`,
@@ -3464,7 +3473,7 @@ export async function POST(req: NextRequest) {
           0.0 AS similarity
         FROM chunks c
         JOIN notes n ON n.id = c.note_id
-        WHERE c.note_id = ANY($2::uuid[]) AND c.content ILIKE '%## 议题%' AND c.content ILIKE $3
+        WHERE c.note_id = ANY($2::uuid[]) AND (c.content ILIKE '%## 议题%' OR c.content ~* '议题[0-9]+[[:space:]]*[:：]') AND c.content ILIKE $3
         ORDER BY c.id
         LIMIT $1`,
         [KEYWORD_K, noteIds, subLike]
@@ -3493,7 +3502,7 @@ export async function POST(req: NextRequest) {
           0.0 AS similarity
         FROM chunks c
         JOIN notes n ON n.id = c.note_id
-        WHERE c.note_id = ANY($2::uuid[]) AND c.content ILIKE '%## 议题%' AND (${or})
+        WHERE c.note_id = ANY($2::uuid[]) AND (c.content ILIKE '%## 议题%' OR c.content ~* '议题[0-9]+[[:space:]]*[:：]') AND (${or})
         ORDER BY c.id
         LIMIT $1`,
         [KEYWORD_K, noteIds, ...likes]
@@ -4223,12 +4232,13 @@ export async function POST(req: NextRequest) {
     if (
       recordHint?.kind === "meeting" &&
       recordHint.id &&
-      recordPrimarySubtopic &&
+      (recordPrimarySubtopic || recordSubtopic) &&
       meetingSectionBoundsDb &&
       meetingSectionNoteContent
     ) {
+      const subtopic = recordPrimarySubtopic ?? recordSubtopic!;
       const sectionText = meetingSectionNoteContent.slice(meetingSectionBoundsDb.start, meetingSectionBoundsDb.end);
-      const agenda = extractAgendaSectionFromRecordSection(sectionText, meetingSectionBoundsDb.start, recordPrimarySubtopic);
+      const agenda = extractAgendaSectionFromRecordSection(sectionText, meetingSectionBoundsDb.start, subtopic);
       if (agenda) {
         const filename = baseSources.find((s) => s.noteId === meetingSectionBoundsDb.noteId)?.filename ?? "meeting_record";
         focusedSources = [
@@ -4608,28 +4618,71 @@ export async function POST(req: NextRequest) {
       // Record + subtopic fallback: if user asks about a specific meeting record and subtopic,
       // but the model says "no info", extract evidence lines directly from scoped sources.
       if (recordHint?.kind === "meeting" && recordHint.id && recordSubtopic) {
+        if (meetingSectionBoundsDb && meetingSectionNoteContent) {
+          const sectionText = meetingSectionNoteContent.slice(meetingSectionBoundsDb.start, meetingSectionBoundsDb.end);
+          const agenda = extractAgendaSectionFromRecordSection(
+            sectionText,
+            meetingSectionBoundsDb.start,
+            recordSubtopic
+          );
+          if (agenda) {
+            const filename =
+              baseSources.find((s) => s.noteId === meetingSectionBoundsDb.noteId)?.filename ?? "meeting_record";
+            const sourcesForResp: SourceChunk[] = [
+              {
+                index: 1,
+                noteId: meetingSectionBoundsDb.noteId,
+                filename,
+                content: agenda.content,
+                startChar: agenda.startChar,
+                endChar: agenda.endChar,
+                similarity: 0.99,
+              },
+            ];
+            const lines = extractMeetingAgendaEvidenceLines(agenda.content, recordSubtopic, 10);
+            const answer = stripMarkdownFormattingInAnswer(
+              lines.length > 0
+                ? [
+                    `在你的笔记中，“会议记录 ${recordHint.id}”里关于“${recordSubtopic}”的内容如下：`,
+                    ...lines.map((l) => `${l} [1]`),
+                  ].join("\n")
+                : `在你的笔记中，“会议记录 ${recordHint.id}”里关于“${recordSubtopic}”的讨论见引用段落。[1]`
+            );
+            return NextResponse.json({
+              answer,
+              sources: sourcesForResp,
+              hasAnswer: true,
+              rewrittenQuestion: retrievalQuestion === question ? undefined : retrievalQuestion,
+            });
+          }
+        }
+
         const scoped =
-          recordNoteIds.size > 0
-            ? baseSources.filter((s) => recordNoteIds.has(s.noteId))
-            : baseSources.filter((s) => recordTokensStrict.some((t) => includesLoose(s.filename, t) || includesLoose(s.content, t)));
+          meetingSectionBoundsDb && meetingSectionNoteContent
+            ? sectionScopedSources.filter((s) => s.noteId === meetingSectionBoundsDb.noteId)
+            : recordNoteIds.size > 0
+              ? baseSources.filter((s) => recordNoteIds.has(s.noteId))
+              : baseSources.filter((s) =>
+                  recordTokensStrict.some((t) => includesLoose(s.filename, t) || includesLoose(s.content, t))
+                );
 
         const agendaEvidence = scoped
           .map((s) => ({ s, lines: extractMeetingAgendaEvidenceLines(s.content, recordSubtopic, 10) }))
           .filter((x) => x.lines.length > 0)
           .slice(0, 1);
-        const genericEvidence = scoped
-          .map((s) => ({ s, lines: extractEvidenceLinesFromSource(s.content, recordSubtopic, 4) }))
-          .filter((x) => x.lines.length > 0)
-          .slice(0, 2);
+        const genericEvidence =
+          agendaEvidence.length > 0
+            ? []
+            : scoped
+                .map((s) => ({ s, lines: extractEvidenceLinesFromSource(s.content, recordSubtopic, 4) }))
+                .filter((x) => x.lines.length > 0)
+                .slice(0, 1);
 
-        const evidences = (agendaEvidence.length > 0 ? agendaEvidence : genericEvidence).slice(0, 3);
+        const evidences = (agendaEvidence.length > 0 ? agendaEvidence : genericEvidence).slice(0, 1);
         if (evidences.length > 0) {
           // Put evidence sources first so citations map to visible blocks.
           const evidenceSources = evidences.map((e) => e.s);
-          const pickedSources = [
-            ...evidenceSources,
-            ...scoped.filter((s) => !evidenceSources.some((e) => e.noteId === s.noteId && e.startChar === s.startChar && e.endChar === s.endChar)),
-          ].slice(0, LLM_TOP_K);
+          const pickedSources = evidenceSources.slice(0, 1);
           const sourcesForResp = pickedSources.map((s, i) => ({ ...s, index: i + 1 }));
 
           // Build an index map for evidence sources (by noteId + range) to stable [n] citations.
